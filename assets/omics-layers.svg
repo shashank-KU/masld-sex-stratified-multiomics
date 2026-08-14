@@ -1,0 +1,67 @@
+<svg width="1000" height="470" viewBox="0 0 1000 470" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1000" height="470" rx="20" fill="#FFFFFF"/>
+  <text x="500" y="42" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="24" font-weight="700" fill="#1D2939">Four Integrated Omics Layers</text>
+  <text x="500" y="66" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" fill="#667085">Each layer is preprocessed and networked independently before cross-omics integration</text>
+
+  <!-- Card TC -->
+  <g>
+    <rect x="40" y="90" width="190" height="230" rx="16" fill="#EFF8FF" stroke="#2E90FA" stroke-width="1.5"/>
+    <circle cx="135" cy="140" r="30" fill="#2E90FA"/>
+    <path d="M120 140 q7 -16 15 0 t15 0" stroke="#FFFFFF" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M120 148 q7 16 15 0 t15 0" stroke="#FFFFFF" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <text x="135" y="196" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#175CD3">TC</text>
+    <text x="135" y="220" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1D2939">Transcriptomics</text>
+    <text x="135" y="240" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#667085">Liver biopsy</text>
+    <text x="135" y="262" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#2E90FA">STAR · RSEM · DESeq2</text>
+    <text x="135" y="296" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#98A2B3">56 men · 154 women</text>
+  </g>
+
+  <!-- Card LC -->
+  <g>
+    <rect x="270" y="90" width="190" height="230" rx="16" fill="#F4F3FF" stroke="#7A5AF8" stroke-width="1.5"/>
+    <circle cx="365" cy="140" r="30" fill="#7A5AF8"/>
+    <path d="M365 122 C 355 138, 350 148, 365 158 C 380 148, 375 138, 365 122 Z" fill="#FFFFFF"/>
+    <text x="365" y="196" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#5925DC">LC</text>
+    <text x="365" y="220" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1D2939">Lipidomics</text>
+    <text x="365" y="240" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#667085">Liver biopsy</text>
+    <text x="365" y="262" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#7A5AF8">UHPLC-QTOFMS</text>
+    <text x="365" y="296" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#98A2B3">57 men · 154 women</text>
+  </g>
+
+  <!-- Card MC -->
+  <g>
+    <rect x="500" y="90" width="190" height="230" rx="16" fill="#FDF2FA" stroke="#F670C7" stroke-width="1.5"/>
+    <circle cx="595" cy="140" r="30" fill="#F670C7"/>
+    <polygon points="595,124 608,132 608,148 595,156 582,148 582,132" fill="#FFFFFF"/>
+    <text x="595" y="196" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#C11574">MC</text>
+    <text x="595" y="220" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1D2939">Metabolomics</text>
+    <text x="595" y="240" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#667085">Liver biopsy</text>
+    <text x="595" y="262" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#F670C7">Polar &amp; semipolar</text>
+    <text x="595" y="296" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#98A2B3">52 men · 137 women</text>
+  </g>
+
+  <!-- Card SMC -->
+  <g>
+    <rect x="730" y="90" width="190" height="230" rx="16" fill="#ECFDF3" stroke="#12B76A" stroke-width="1.5"/>
+    <circle cx="825" cy="140" r="30" fill="#12B76A"/>
+    <circle cx="825" cy="140" r="11" fill="none" stroke="#FFFFFF" stroke-width="3"/>
+    <text x="825" y="196" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="20" font-weight="700" fill="#027A48">SMC</text>
+    <text x="825" y="220" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="600" fill="#1D2939">Serum Metabolomics</text>
+    <text x="825" y="240" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="12" fill="#667085">Serum</text>
+    <text x="825" y="262" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#12B76A">Systemic features</text>
+    <text x="825" y="296" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#98A2B3">57 men · 152 women</text>
+  </g>
+
+  <!-- Connectors to hub -->
+  <g fill="none" stroke-width="2">
+    <path d="M135 320 C 135 370, 400 380, 460 400" stroke="#2E90FA" stroke-opacity="0.55"/>
+    <path d="M365 320 C 365 360, 430 380, 480 400" stroke="#7A5AF8" stroke-opacity="0.55"/>
+    <path d="M595 320 C 595 360, 550 380, 520 400" stroke="#F670C7" stroke-opacity="0.55"/>
+    <path d="M825 320 C 825 370, 600 380, 540 400" stroke="#12B76A" stroke-opacity="0.55"/>
+  </g>
+
+  <!-- Hub -->
+  <rect x="310" y="400" width="380" height="56" rx="28" fill="#F4EBFF" stroke="#7F56D9" stroke-width="1.5"/>
+  <text x="500" y="424" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#53389E">Integrated Multi-Omics Network</text>
+  <text x="500" y="442" text-anchor="middle" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="11" fill="#7F56D9">WGCNA eigengenes · cross-omics correlation · mediation</text>
+</svg>
