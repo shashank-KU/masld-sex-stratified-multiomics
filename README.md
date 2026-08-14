@@ -58,27 +58,239 @@ The repository supports the following analytical objectives:
 
 ## Analysis overview
 
+The workflow separates restricted participant-level inputs from reproducible analytical steps and approved public outputs. Dashed arrows indicate validation or sensitivity checks rather than the main analytical path.
+
 ```mermaid
-flowchart LR
-    A[Restricted local input data] --> B[Preprocessing and quality control]
-    B --> C1[Liver transcriptomics]
-    B --> C2[Liver lipidomics]
-    B --> C3[Liver metabolomics]
-    B --> C4[Serum metabolomics]
-    C1 --> D[WGCNA modules and eigengenes]
-    C2 --> D
-    C3 --> D
-    C4 --> D
-    D --> E[Module-histology associations]
-    D --> F[Cross-omics integration]
-    D --> G[Mediation analysis]
-    E --> H[Sex-stratified interpretation]
-    E --> I[Layer-specific size-matched sensitivity analysis]
-    F --> J[Figures and summary outputs]
-    G --> J
-    H --> J
-    I --> J
+flowchart TB
+
+    %% =========================
+    %% INPUT AND GOVERNANCE LAYER
+    %% =========================
+    subgraph G0["Data governance and restricted inputs"]
+        direction LR
+        P1["Clinical and histological metadata<br/>age, sex, BMI, steatosis,<br/>inflammation, fibrosis"]
+        P2["Liver transcriptomics<br/>raw RNA-seq reads"]
+        P3["Liver lipidomics<br/>UHPLC-QTOFMS data"]
+        P4["Liver metabolomics<br/>polar and semipolar features"]
+        P5["Serum metabolomics<br/>systemic metabolic features"]
+        PRIV["Restricted local environment<br/>participant-level data are not public"]
+
+        P1 --> PRIV
+        P2 --> PRIV
+        P3 --> PRIV
+        P4 --> PRIV
+        P5 --> PRIV
+    end
+
+    %% =========================
+    %% PREPROCESSING LAYER
+    %% =========================
+    subgraph G1["Preprocessing and quality control"]
+        direction LR
+
+        TPRE["Transcriptomics preprocessing<br/>STAR alignment<br/>RSEM quantification<br/>low-expression filtering<br/>DESeq2 transformation"]
+
+        LPRE["Lipidomics preprocessing<br/>MSConvert to mzML<br/>MZmine feature processing<br/>internal-standard normalization<br/>log2 transformation and scaling"]
+
+        MPRE["Liver metabolomics preprocessing<br/>MSConvert to mzML<br/>MZmine feature processing<br/>half-minimum imputation<br/>normalization and scaling"]
+
+        SPRE["Serum metabolomics preprocessing<br/>feature filtering<br/>half-minimum imputation<br/>normalization and scaling"]
+
+        QC["Quality-control gate<br/>sample identifiers aligned<br/>duplicate identifiers excluded<br/>missingness and feature variation checked"]
+    end
+
+    PRIV --> TPRE
+    PRIV --> LPRE
+    PRIV --> MPRE
+    PRIV --> SPRE
+
+    TPRE --> QC
+    LPRE --> QC
+    MPRE --> QC
+    SPRE --> QC
+
+    %% =========================
+    %% OMICS NETWORK LAYER
+    %% =========================
+    subgraph G2["Layer-specific network analysis"]
+        direction LR
+
+        TSFT["TC soft-threshold selection<br/>signed network and bicor"]
+        LSFT["LC soft-threshold selection<br/>signed network and bicor"]
+        MSFT["MC soft-threshold selection<br/>signed network and bicor"]
+        SSFT["SMC soft-threshold selection<br/>signed network and bicor"]
+
+        TW["TC WGCNA<br/>modules, eigengenes,<br/>hub genes"]
+        LW["LC WGCNA<br/>modules, eigengenes,<br/>hub lipids"]
+        MW["MC WGCNA<br/>modules, eigengenes,<br/>hub metabolites"]
+        SW["SMC WGCNA<br/>modules, eigengenes,<br/>hub metabolites"]
+
+        TSFT --> TW
+        LSFT --> LW
+        MSFT --> MW
+        SSFT --> SW
+    end
+
+    QC --> TSFT
+    QC --> LSFT
+    QC --> MSFT
+    QC --> SSFT
+
+    %% =========================
+    %% ASSOCIATION LAYER
+    %% =========================
+    subgraph G3["Sex-stratified module-histology analysis"]
+        direction TB
+
+        SPLIT["Prespecified sex stratification<br/>women and men analyzed separately"]
+
+        TRAITS["Histological traits<br/>steatosis, inflammation, fibrosis"]
+
+        COR["Module-trait association testing<br/>Spearman correlation"]
+
+        FDR["Within-layer multiple-testing control<br/>FDR threshold defined in the analysis"]
+
+        SIG["Significant module-histology associations"]
+
+        SPLIT --> COR
+        TRAITS --> COR
+        COR --> FDR
+        FDR --> SIG
+    end
+
+    TW --> SPLIT
+    LW --> SPLIT
+    MW --> SPLIT
+    SW --> SPLIT
+
+    P1 --> TRAITS
+
+    %% =========================
+    %% INTEGRATION LAYER
+    %% =========================
+    subgraph G4["Multi-omics integration and interpretation"]
+        direction LR
+
+        CROSS["Cross-omics correlations<br/>TC-LC, TC-MC, LC-MC,<br/>and serum-linked comparisons"]
+
+        DIFF["Differential analysis<br/>histology-associated molecular features"]
+
+        TENRICH["Transcriptomic enrichment<br/>KEGG analysis with clusterProfiler"]
+
+        MENRICH["Metabolic pathway analysis<br/>MetaboAnalyst"]
+
+        MED["Mediation analysis<br/>transcriptomic module to mediator module<br/>to binary histological outcome"]
+
+        VIS["Integrative visualization<br/>heatmaps, chord diagrams,<br/>alluvial plots, multipanel figures"]
+    end
+
+    TW --> CROSS
+    LW --> CROSS
+    MW --> CROSS
+    SW --> CROSS
+
+    SIG --> CROSS
+    SIG --> DIFF
+    TW --> TENRICH
+    LW --> MENRICH
+    MW --> MENRICH
+    SW --> MENRICH
+    CROSS --> MED
+
+    CROSS --> VIS
+    DIFF --> VIS
+    TENRICH --> VIS
+    MENRICH --> VIS
+    MED --> VIS
+
+    %% =========================
+    %% SENSITIVITY AND VALIDATION
+    %% =========================
+    subgraph G5["Sensitivity analysis and internal validation"]
+        direction TB
+
+        AVAIL["Layer-specific sample availability<br/>SMC: 57 men and 152 women<br/>MC: 52 men and 137 women<br/>LC: 57 men and 154 women<br/>TC: 56 men and 154 women"]
+
+        MVALID["Male-count validation<br/>original and recalculated counts agree<br/>SMC 0, MC 0, LC 16, TC 7<br/>total 23"]
+
+        RESAMPLE["10,000 female resampling iterations<br/>sampling without replacement<br/>matched to male availability within each layer"]
+
+        RECALC["Recalculate Spearman associations<br/>and within-layer FDR in every iteration"]
+
+        DIST["Female matched distribution<br/>median 28, IQR 22 to 35<br/>2.5th to 97.5th percentile: 12 to 49"]
+
+        EMP["Empirical comparison<br/>69.12% of iterations exceeded 23<br/>one-sided lower-tail probability 0.3089"]
+
+        CAUTION["Interpretation gate<br/>apparent sex difference remains unresolved<br/>after matching sample size and availability"]
+
+        AVAIL --> RESAMPLE
+        MVALID --> RESAMPLE
+        RESAMPLE --> RECALC
+        RECALC --> DIST
+        DIST --> EMP
+        EMP --> CAUTION
+    end
+
+    SIG -. "audit observed counts" .-> MVALID
+    QC -. "verify layer availability" .-> AVAIL
+    FDR -. "repeat identical test family" .-> RECALC
+    CAUTION -. "qualifies interpretation" .-> VIS
+
+    %% =========================
+    %% OUTPUT AND RELEASE LAYER
+    %% =========================
+    subgraph G6["Outputs, disclosure review, and release"]
+        direction LR
+
+        OUT1["Analysis outputs<br/>summary tables and figures"]
+        OUT2["Reproducibility records<br/>R Markdown, session information,<br/>random seeds, software versions"]
+        REVIEW["Disclosure review<br/>remove identifiers, local paths,<br/>restricted tables, caches, and logs"]
+        PUBLIC["Public repository<br/>code, documentation,<br/>approved figures only"]
+        ARCHIVE["Versioned archival release<br/>GitHub release and Zenodo DOI"]
+
+        OUT1 --> REVIEW
+        OUT2 --> REVIEW
+        REVIEW --> PUBLIC
+        PUBLIC --> ARCHIVE
+    end
+
+    VIS --> OUT1
+    CAUTION --> OUT1
+    QC --> OUT2
+    G2 --> OUT2
+    G5 --> OUT2
+
+    %% =========================
+    %% STYLING
+    %% =========================
+    classDef restricted fill:#FDECEC,stroke:#B42318,color:#7A271A,stroke-width:1.5px;
+    classDef preprocessing fill:#FFF4E5,stroke:#B54708,color:#7A2E0E,stroke-width:1.2px;
+    classDef network fill:#E8F3FF,stroke:#175CD3,color:#1849A9,stroke-width:1.2px;
+    classDef analysis fill:#EEF4FF,stroke:#3538CD,color:#2D31A6,stroke-width:1.2px;
+    classDef integration fill:#F4EBFF,stroke:#7F56D9,color:#53389E,stroke-width:1.2px;
+    classDef validation fill:#ECFDF3,stroke:#039855,color:#027A48,stroke-width:1.2px;
+    classDef caution fill:#FFF1F3,stroke:#E31B54,color:#C01048,stroke-width:1.5px;
+    classDef output fill:#F2F4F7,stroke:#475467,color:#344054,stroke-width:1.2px;
+
+    class P1,P2,P3,P4,P5,PRIV restricted;
+    class TPRE,LPRE,MPRE,SPRE,QC preprocessing;
+    class TSFT,LSFT,MSFT,SSFT,TW,LW,MW,SW network;
+    class SPLIT,TRAITS,COR,FDR,SIG analysis;
+    class CROSS,DIFF,TENRICH,MENRICH,MED,VIS integration;
+    class AVAIL,MVALID,RESAMPLE,RECALC,DIST,EMP validation;
+    class CAUTION caution;
+    class OUT1,OUT2,REVIEW,PUBLIC,ARCHIVE output;
 ```
+
+### Workflow interpretation
+
+1. **Restricted participant-level data remain local.** The public repository begins at the reproducible-code and approved-output layer, not at the raw-data layer.
+2. **Each omics layer is preprocessed and networked separately.** Module eigengenes provide a common representation for downstream integration.
+3. **Sex-stratified associations are evaluated consistently.** Steatosis, inflammation, and fibrosis are tested against module eigengenes using Spearman correlation with within-layer FDR control.
+4. **Cross-omics and mediation analyses connect molecular layers.** Enrichment and visualization provide biological interpretation of module-level findings.
+5. **The size-matched analysis is a sensitivity analysis of detected association counts.** The analysis does not rebuild the WGCNA networks within every resample and therefore does not directly test intrinsic network-density differences.
+6. **A disclosure-review gate separates internal analysis from public release.** Only code, documentation, and approved non-sensitive outputs are published.
+
 
 ### Core analytical methods
 
