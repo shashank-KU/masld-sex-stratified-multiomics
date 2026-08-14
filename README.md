@@ -1,46 +1,64 @@
-# MASLD Sex-Stratified Multi-Omics Analysis
+<p align="center">
+  <img src="assets/banner.svg" alt="MASLD Sex-Stratified Multi-Omics Analysis" width="100%" />
+</p>
 
-[![R](https://img.shields.io/badge/R-4.4.1-276DC3?logo=r&logoColor=white)](https://www.r-project.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Repository](https://img.shields.io/badge/GitHub-analysis%20workflow-181717?logo=github)](https://github.com/shashank-KU/masld-sex-stratified-multiomics)
-[![Data status](https://img.shields.io/badge/data-restricted-critical)](#data-availability-and-privacy)
-[![Reproducibility](https://img.shields.io/badge/workflow-R%20Markdown-75AADB)](MASLD_complete_analysis.Rmd)
+<p align="center">
+  <a href="https://www.r-project.org/"><img alt="R" src="https://img.shields.io/badge/R-4.4.1-276DC3?logo=r&logoColor=white" /></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" /></a>
+  <a href="https://github.com/shashank-KU/masld-sex-stratified-multiomics"><img alt="Repository" src="https://img.shields.io/badge/GitHub-analysis%20workflow-181717?logo=github&logoColor=white" /></a>
+  <a href="#-data-availability-and-privacy"><img alt="Data status" src="https://img.shields.io/badge/data-restricted-critical" /></a>
+  <a href="MASLD_complete_analysis.Rmd"><img alt="Reproducibility" src="https://img.shields.io/badge/workflow-R%20Markdown-75AADB" /></a>
+  <img alt="Maintenance" src="https://img.shields.io/badge/Maintained%3F-yes-brightgreen.svg" />
+</p>
 
-A reproducible R workflow for sex-stratified multi-omics analysis of metabolic dysfunction-associated steatotic liver disease (MASLD). The workflow integrates liver transcriptomics, liver lipidomics, liver metabolomics, and serum metabolomics to evaluate molecular modules, histological associations, cross-omics relationships, mediation patterns, and sample-size sensitivity.
+<p align="center">
+  <img alt="Last commit" src="https://img.shields.io/github/last-commit/shashank-KU/masld-sex-stratified-multiomics" />
+  <img alt="Repo size" src="https://img.shields.io/github/repo-size/shashank-KU/masld-sex-stratified-multiomics" />
+  <img alt="Open issues" src="https://img.shields.io/github/issues/shashank-KU/masld-sex-stratified-multiomics" />
+  <img alt="Stars" src="https://img.shields.io/github/stars/shashank-KU/masld-sex-stratified-multiomics?style=social" />
+</p>
 
-> **Repository scope:** This public repository contains analysis code, documentation, and approved figures only. Individual-level phenotype and omics data are not included because public release is restricted.
+<p align="center">
+A reproducible R workflow for <b>sex-stratified multi-omics analysis</b> of metabolic dysfunction-associated steatotic liver disease (MASLD). The workflow integrates liver transcriptomics, liver lipidomics, liver metabolomics, and serum metabolomics to evaluate molecular modules, histological associations, cross-omics relationships, mediation patterns, and sample-size sensitivity.
+</p>
+
+> **Repository scope:** This public repository contains analysis code, documentation, and approved figures only. Individual-level phenotype and omics data are **not** included because public release is restricted.
+
+---
 
 ## Contents
 
-- [Scientific scope](#scientific-scope)
-- [Analysis overview](#analysis-overview)
-- [Repository structure](#repository-structure)
-- [Software environment](#software-environment)
-- [Running the workflow](#running-the-workflow)
-- [Expected outputs](#expected-outputs)
-- [Data availability and privacy](#data-availability-and-privacy)
-- [Reproducibility and quality control](#reproducibility-and-quality-control)
-- [Responsible interpretation](#responsible-interpretation)
-- [Citation](#citation)
-- [License](#license)
-- [Contact](#contact)
+- [🧬 Scientific scope](#-scientific-scope)
+- [🔬 Analysis overview](#-analysis-overview)
+- [📁 Repository structure](#-repository-structure)
+- [🔧 Software environment](#-software-environment)
+- [🚀 Running the workflow](#-running-the-workflow)
+- [📊 Expected outputs](#-expected-outputs)
+- [🔒 Data availability and privacy](#-data-availability-and-privacy)
+- [✅ Reproducibility and quality control](#-reproducibility-and-quality-control)
+- [⚠ Responsible interpretation](#-responsible-interpretation)
+- [📄 Citation](#-citation)
+- [📜 License](#-license)
+- [👤 Author](#-author)
+- [📧 Contact](#-contact)
+- [🙏 Acknowledgment](#-acknowledgment)
 
-## Scientific scope
+---
 
-The workflow evaluates molecular patterns associated with three liver histological features:
+## 🧬 Scientific scope
 
-- steatosis;
-- inflammation;
-- fibrosis.
+The workflow evaluates molecular patterns associated with three liver histological features: **steatosis**, **inflammation**, and **fibrosis**.
 
-Four omics layers are integrated:
+<p align="center">
+  <img src="assets/omics-layers.svg" alt="Four integrated omics layers: TC, LC, MC, SMC" width="100%" />
+</p>
 
 | Abbreviation | Omics layer | Biological source |
-|---|---|---|
-| SMC | Serum metabolomics | Serum |
-| MC | Metabolomics | Liver biopsy |
-| LC | Lipidomics | Liver biopsy |
-| TC | Transcriptomics | Liver biopsy |
+|:---:|---|---|
+| **SMC** | Serum metabolomics | Serum |
+| **MC** | Metabolomics | Liver biopsy |
+| **LC** | Lipidomics | Liver biopsy |
+| **TC** | Transcriptomics | Liver biopsy |
 
 The repository supports the following analytical objectives:
 
@@ -56,9 +74,50 @@ The repository supports the following analytical objectives:
 10. assess mediation patterns across molecular layers;
 11. evaluate sensitivity to unequal sample size and layer-specific data availability.
 
-## Analysis overview
+---
 
-The workflow separates restricted participant-level inputs from reproducible analytical steps and approved public outputs. Dashed arrows indicate validation or sensitivity checks rather than the main analytical path.
+## 🔬 Analysis overview
+
+```mermaid
+flowchart LR
+    A[Restricted local input data] --> B[Preprocessing and quality control]
+    B --> C1[Liver transcriptomics]
+    B --> C2[Liver lipidomics]
+    B --> C3[Liver metabolomics]
+    B --> C4[Serum metabolomics]
+    C1 --> D[WGCNA modules and eigengenes]
+    C2 --> D
+    C3 --> D
+    C4 --> D
+    D --> E[Module-histology associations]
+    D --> F[Cross-omics integration]
+    D --> G[Mediation analysis]
+    E --> H[Sex-stratified interpretation]
+    E --> I[Layer-specific size-matched sensitivity analysis]
+    F --> J[Figures and summary outputs]
+    G --> J
+    H --> J
+    I --> J
+```
+
+### Core analytical methods
+
+| Category | Method / tool | Description |
+|---|---|---|
+| Network analysis | **WGCNA** (biweight midcorrelation, signed) | Weighted co-expression network construction |
+| Module associations | Spearman correlation | Module eigengenes vs. histological traits |
+| Multiple testing | FDR adjustment | Threshold defined in the analysis script and manuscript |
+| Transcriptomics | STAR → RSEM → DESeq2 | Alignment, quantification, normalization, differential analysis |
+| Pathway analysis | clusterProfiler / MetaboAnalyst | Transcriptomic enrichment and metabolic pathway analysis |
+| Mediation | `mediation` R package | Regression-based mediation analysis |
+| Visualization | ggplot2, circlize, pheatmap, ggalluvial, cowplot, patchwork | Statistical and integrative visualization |
+
+### Advanced governance-aware workflow
+
+The full workflow separates restricted participant-level inputs from reproducible analytical steps and approved public outputs. Dashed arrows below indicate validation or sensitivity checks rather than the main analytical path.
+
+<details>
+<summary><b>📈 Show the full workflow diagram</b> — governance → preprocessing → networks → sex-stratified associations → integration → sensitivity → release</summary>
 
 ```mermaid
 flowchart TB
@@ -282,51 +341,59 @@ flowchart TB
     class OUT1,OUT2,REVIEW,PUBLIC,ARCHIVE output;
 ```
 
-### Workflow interpretation
+</details>
+
+**Workflow interpretation**
 
 1. **Restricted participant-level data remain local.** The public repository begins at the reproducible-code and approved-output layer, not at the raw-data layer.
 2. **Each omics layer is preprocessed and networked separately.** Module eigengenes provide a common representation for downstream integration.
 3. **Sex-stratified associations are evaluated consistently.** Steatosis, inflammation, and fibrosis are tested against module eigengenes using Spearman correlation with within-layer FDR control.
 4. **Cross-omics and mediation analyses connect molecular layers.** Enrichment and visualization provide biological interpretation of module-level findings.
-5. **The size-matched analysis is a sensitivity analysis of detected association counts.** The analysis does not rebuild the WGCNA networks within every resample and therefore does not directly test intrinsic network-density differences.
+5. **The size-matched analysis is a sensitivity analysis of detected association counts.** It does not rebuild the WGCNA networks within every resample and therefore does not directly test intrinsic network-density differences.
 6. **A disclosure-review gate separates internal analysis from public release.** Only code, documentation, and approved non-sensitive outputs are published.
 
+### Main analysis file
 
-### Core analytical methods
+The complete workflow is provided in [`MASLD_complete_analysis.Rmd`](MASLD_complete_analysis.Rmd) — the authoritative analysis source in this repository.
 
-- **Network analysis:** WGCNA with biweight midcorrelation and signed networks.
-- **Module associations:** Spearman correlations between module eigengenes and histological traits.
-- **Multiple testing:** false discovery rate adjustment, with the threshold defined in the analysis script and manuscript.
-- **Transcriptomics:** STAR and RSEM preprocessing followed by DESeq2-based normalization and differential analysis.
-- **Pathway analysis:** clusterProfiler for transcriptomic enrichment and MetaboAnalyst for metabolic pathway analysis.
-- **Mediation:** regression-based mediation analysis using the `mediation` R package.
-- **Visualization:** `ggplot2`, `circlize`, `pheatmap`, `ggalluvial`, `cowplot`, and `patchwork`.
+---
 
-## Main analysis file
-
-The complete workflow is provided in:
-
-```text
-MASLD_complete_analysis.Rmd
-```
-
-The R Markdown document is the authoritative analysis source in this repository.
-
-## Repository structure
+## 📁 Repository structure
 
 ```text
 masld-sex-stratified-multiomics/
 ├── README.md
 ├── LICENSE
 ├── MASLD_complete_analysis.Rmd
-└── Figures/
+├── Figures/                  # Approved, disclosure-reviewed figures only
+└── assets/                   # README graphics (banner, diagrams)
+    ├── banner.svg
+    └── omics-layers.svg
 ```
 
 Restricted data directories are intentionally excluded from the public repository. The workflow expects authorized input files to be available locally in the directory structure referenced by the R Markdown document.
 
-## Software environment
+---
 
-The analysis was conducted in **R 4.4.1**. Major analytical packages include:
+## 🔧 Software environment
+
+The analysis was conducted in **R 4.4.1**.
+
+<p align="left">
+  <img alt="WGCNA" src="https://img.shields.io/badge/WGCNA-1.73-1849A9" />
+  <img alt="DESeq2" src="https://img.shields.io/badge/DESeq2-1.44.0-B54708" />
+  <img alt="clusterProfiler" src="https://img.shields.io/badge/clusterProfiler-4.12.6-175CD3" />
+  <img alt="mediation" src="https://img.shields.io/badge/mediation-4.5.0-7F56D9" />
+  <img alt="circlize" src="https://img.shields.io/badge/circlize-0.4.16-039855" />
+  <img alt="ggplot2" src="https://img.shields.io/badge/ggplot2-3.5.1-3538CD" />
+  <img alt="MetaboAnalystR" src="https://img.shields.io/badge/MetaboAnalystR-4.0.0-C11574" />
+  <img alt="POMA" src="https://img.shields.io/badge/POMA-1.14.0-475467" />
+</p>
+
+<details>
+<summary><b>Show full package table</b></summary>
+
+<br/>
 
 | Package or software | Version used | Primary purpose |
 |---|---:|---|
@@ -347,6 +414,8 @@ The analysis was conducted in **R 4.4.1**. Major analytical packages include:
 
 Additional software used upstream includes ProteoWizard/MSConvert, MZmine, STAR, RSEM, and MetaboAnalyst. Exact versions and citations are reported in the manuscript Key Resources Table where available.
 
+</details>
+
 For exact dependency and platform information, add a `sessionInfo.txt` file generated from the final analysis environment:
 
 ```r
@@ -364,7 +433,9 @@ renv::init()
 renv::snapshot()
 ```
 
-## Running the workflow
+---
+
+## 🚀 Running the workflow
 
 ### 1. Clone the repository
 
@@ -414,7 +485,9 @@ Inspect all rendered reports, tables, figures, caches, and logs for:
 - temporary files;
 - unexpectedly large outputs.
 
-## Expected outputs
+---
+
+## 📊 Expected outputs
 
 Depending on the available inputs and enabled analysis chunks, the workflow can generate:
 
@@ -432,9 +505,16 @@ Depending on the available inputs and enabled analysis chunks, the workflow can 
 
 Approved figures can be stored in the `Figures/` directory. Generated participant-level or intermediate outputs must remain outside the public repository.
 
-## Data availability and privacy
+---
+
+## 🔒 Data availability and privacy
 
 Individual-level clinical and omics datasets are not distributed through this repository. Publicly available code does not confer access to restricted study data.
+
+<details>
+<summary><b>Show what must never be committed, and the recommended <code>.gitignore</code></b></summary>
+
+<br/>
 
 Do not commit:
 
@@ -483,7 +563,11 @@ Thumbs.db
 
 Review every exception before using `git add -f`.
 
-## Reproducibility and quality control
+</details>
+
+---
+
+## ✅ Reproducibility and quality control
 
 The workflow includes reproducibility controls designed for the reported analyses:
 
@@ -496,30 +580,33 @@ The workflow includes reproducibility controls designed for the reported analyse
 - multiple-testing correction within defined analysis families;
 - separation of public code from restricted data.
 
-Recommended additions before creating an archival release:
+**Recommended additions before creating an archival release:**
 
-- `sessionInfo.txt`;
-- `renv.lock`;
-- `CITATION.cff`;
-- a tagged GitHub release;
-- a permanent Zenodo archive and DOI;
-- a concise changelog documenting the manuscript-associated release.
+- `sessionInfo.txt`
+- `renv.lock`
+- `CITATION.cff`
+- a tagged GitHub release
+- a permanent Zenodo archive and DOI
+- a concise changelog documenting the manuscript-associated release
 
-## Responsible interpretation
+---
 
-This workflow supports exploratory and discovery-oriented multi-omics analyses. Results should be interpreted in the context of the study design, unequal group sizes, layer-specific missingness, multiple testing, and the availability of independent validation.
+## ⚠ Responsible interpretation
 
-Sex-stratified findings describe associations in the analyzed cohort. The size-matched sensitivity analysis evaluates the number of detected module-histology associations after accounting for sample size and layer-specific availability. The analysis does not, by itself, establish an intrinsic biological difference in network architecture.
+> This workflow supports exploratory and discovery-oriented multi-omics analyses. Results should be interpreted in the context of the study design, unequal group sizes, layer-specific missingness, multiple testing, and the availability of independent validation.
 
-## Code availability statement
+Sex-stratified findings describe associations in the analyzed cohort. The size-matched sensitivity analysis evaluates the number of detected module-histology associations after accounting for sample size and layer-specific availability. **The analysis does not, by itself, establish an intrinsic biological difference in network architecture.**
+
+### Code availability statement
 
 The complete analysis workflow is publicly available in this repository:
-
 [MASLD sex-stratified multi-omics analysis repository](https://github.com/shashank-KU/masld-sex-stratified-multiomics)
 
 For publication, cite a versioned archival DOI once the manuscript-associated release has been deposited in Zenodo. The GitHub repository can remain the actively maintained version.
 
-## Citation
+---
+
+## 📄 Citation
 
 Until the associated manuscript and archival DOI are available, use:
 
@@ -530,21 +617,31 @@ https://github.com/shashank-KU/masld-sex-stratified-multiomics
 
 After publication, replace the temporary citation with the full manuscript citation and archived software DOI. A `CITATION.cff` file should be added at that stage so GitHub can display the preferred citation.
 
-## License
+---
+
+## 📜 License
 
 This repository is distributed under the [MIT License](LICENSE). The license applies to repository code and documentation only. It does not grant access to, or permission to redistribute, restricted participant-level data.
 
-## Author
+---
 
-**Shashank Gupta**  
-Örebro University  
-[GitHub profile](https://github.com/shashank-KU)  
-[Örebro University profile](https://www.oru.se/english/employee/shashank_gupta)
+## 👤 Author
 
-## Contact
+**Shashank Gupta** · Örebro University
+
+<p align="left">
+  <a href="https://github.com/shashank-KU"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-shashank--KU-181717?logo=github&logoColor=white" /></a>
+  <a href="https://www.oru.se/english/employee/shashank_gupta"><img alt="Örebro University" src="https://img.shields.io/badge/%C3%96rebro%20University-profile-003D7C" /></a>
+</p>
+
+---
+
+## 📧 Contact
 
 For questions about the analysis workflow, open a [GitHub issue](https://github.com/shashank-KU/masld-sex-stratified-multiomics/issues). Do not include participant-level information, restricted data, credentials, or confidential study details in public issues.
 
-## Acknowledgment
+---
+
+## 🙏 Acknowledgment
 
 When reusing or adapting this workflow, cite the associated manuscript and the archived software release when available. Please also cite the original software publications listed in the manuscript Key Resources Table.
