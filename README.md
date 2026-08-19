@@ -365,7 +365,7 @@ masld-sex-stratified-multiomics/
 ├── README.md
 ├── LICENSE
 ├── MASLD_complete_analysis.Rmd
-├── Figures/                  # Approved, disclosure-reviewed figures only
+├── Figures/                  
 └── assets/                   # README graphics (banner, diagrams)
     ├── banner.svg
     └── omics-layers.svg
