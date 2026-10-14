@@ -1,0 +1,814 @@
+---
+title: "Fig. 4: paired liver-serum analysis (Tables S10b, S11)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Fig4_paired_liver_serum.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig3_external_validation`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig3_external_validation")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Fig4_paired_liver_serum")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Paired liver-serum analysis: Fig. 4 and Tables S10b-S11
+
+Matched liver and serum polar metabolomes (n = 187). This chunk reads the raw files itself and overwrites `phenotype`.
+
+```{r pairedli-01}
+## =====================================================================
+##  FIGURE 4 – full re-analysis from raw files, start to end
+##
+##  1. read raw liver polar, liver lipid, serum polar + metadata
+##     (POMA half-min imputation, log2, autoscaling – as in the manuscript)
+##  2. pair liver and serum (PCA outlier > 10 MAD removed -> n = 187)
+##  3. liver–serum Spearman rho and liver vs serum histology effects
+##     + within-person difference test            -> Table S10b
+##  4. robustness models (TG index, dilution factor, PQN, HbA1c/glucose,
+##     steatosis) and matched-panel effect sizes   -> Table S11a–c
+##  5. cross-validated AUC                          -> Table S11d–e
+##  6. Figure 4 (a–d)                               -> Fig4.pdf / Fig4.png
+##
+##  Panel d is drawn from Table S11d–e of the SUBMITTED Supplementary
+##  Tables file (AUC_SOURCE = "table"), so the figure always matches the
+##  table and the text.  Step 5 is then skipped (saves 20–40 min).
+##  Panel b plots the standardized mean differences of Table S11b, as the
+##  legend states.
+## =====================================================================
+suppressPackageStartupMessages({
+    library(POMA); library(SummarizedExperiment)
+    library(limma); library(glmnet); library(pROC); library(readxl); library(openxlsx)
+    library(ggplot2); library(patchwork); library(tidyr); library(ggrepel); library(scales); library(ggtext)
+    library(dplyr)
+})
+## make sure dplyr verbs are not masked by plyr / MASS / Hmisc / POMA dependencies
+filter <- dplyr::filter; select <- dplyr::select; mutate <- dplyr::mutate
+arrange <- dplyr::arrange; summarise <- dplyr::summarise; transmute <- dplyr::transmute
+left_join <- dplyr::left_join; distinct <- dplyr::distinct; case_when <- dplyr::case_when
+set.seed(20260921)
+OUT <- "Fig4_reanalysis"; dir.create(OUT, showWarnings = FALSE)
+## ---------------------------------------------------------------------
+## 0. CONFIG – paths and options
+## ---------------------------------------------------------------------
+BASE_DIR   <- project_dir
+F_LIV_POL  <- file.path(BASE_DIR, "Analysis_Polars_Semipolars/exposure_polars_semipolars.xlsx")
+F_LIPID    <- file.path(BASE_DIR, "Analyisis/exposures.xlsx")
+F_LIPDESC  <- file.path(BASE_DIR, "Analyisis/description.xlsx")
+F_SER_POL  <- file.path(BASE_DIR, "Analysis_Serum_Polars_Semipolars/exposure_serum_polars_semipolars.xlsx")
+F_SER_META <- file.path(BASE_DIR, "Analysis_Serum_Polars_Semipolars/Metadata_serum.xlsx")
+## liver metadata: uses `phenotype` if it is in the session (rownames = LIVMF...),
+## otherwise this file (must contain columns id, Gender_M0F1, steatosis_Kleiner, ...)
+META_FILE  <- file.path(BASE_DIR, "Analyisis/Metadata.xlsx")
+EXCLUDE_IDS  <- NULL     # NULL = auto (PCA outlier > 10 MAD; expected LIVMF138)
+EXTRA_COVARS <- c("HbA1c_percent", "Glucose_mgdL")   # glycaemia (as in the manuscript)
+FDR    <- 0.10
+N_REP  <- 10             # CV repeats (use 3 for a quick test run)
+N_FOLD <- 5
+## where panel d takes its AUC values from:
+##   "table"   = Table S11d–e of the submitted Supplementary Tables (recommended)
+##   "reuse"   = 5_cv_auc*.csv already in OUT
+##   "compute" = rerun the cross-validation (20–40 min)
+AUC_SOURCE <- "table"
+TABLES_XLSX <- SUPP_XLSX  # <- check path
+if (AUC_SOURCE == "table" && !file.exists(TABLES_XLSX)) {
+    message("Supplementary Tables file not found at TABLES_XLSX - please select it")
+    TABLES_XLSX <- file.choose()
+}
+AUC_SHEET   <- "Table S11"
+if (AUC_SOURCE == "table") {
+    sh <- openxlsx::getSheetNames(TABLES_XLSX)
+    if (!AUC_SHEET %in% sh && "Table S13" %in% sh) AUC_SHEET <- "Table S13"   # old (un-renumbered) file
+    stopifnot("AUC sheet not found in TABLES_XLSX" = AUC_SHEET %in% sh)
+}
+## ---------------------------------------------------------------------
+## A. read and preprocess the three omics files (as in your Rmd)
+## ---------------------------------------------------------------------
+if (!exists("phenotype")) {
+    phenotype <- as.data.frame(read_excel(META_FILE)); rownames(phenotype) <- phenotype$id
+}
+liv_ids <- rownames(phenotype)
+## POMA pipeline -> list(log2 = samples x features, auto = samples x features)
+poma_prep <- function(features, cutoff) {
+    features <- as.data.frame(lapply(as.data.frame(features, check.names = FALSE),
+                                     function(v) suppressWarnings(as.numeric(v))),
+                              check.names = FALSE, row.names = rownames(features))
+    md <- data.frame(SampleID = rownames(features))
+    obj  <- POMA::PomaCreateObject(metadata = md, features = features)
+    imp  <- POMA::PomaImpute(obj, method = "half_min", zeros_as_na = TRUE, remove_na = TRUE, cutoff = cutoff)
+    lg   <- POMA::PomaNorm(imp, method = "log_transform")
+    au   <- POMA::PomaNorm(lg,  method = "auto_scaling")
+    tm <- function(se) { m <- t(SummarizedExperiment::assay(se)); storage.mode(m) <- "double"; m }
+    list(log2 = tm(lg), auto = tm(au))
+}
+## A1. liver polar/semipolar (cutoff 99, as in your Rmd)
+lp <- data.frame(read_excel(F_LIV_POL)); names(lp) <- gsub("^X", "", names(lp))
+rownames(lp) <- lp$id; lp$id <- NULL
+lp <- lp[intersect(rownames(lp), liv_ids), , drop = FALSE]
+tmp <- poma_prep(lp, cutoff = 99)
+liver_polar_log2 <- tmp$log2; liver_polar <- tmp$auto
+## A2. liver lipidomics (cutoff 20), with Family_name labels
+desc <- data.frame(read_excel(F_LIPDESC)); rownames(desc) <- desc$Exposure; desc <- desc[, -2]
+ll <- data.frame(read_excel(F_LIPID)); rownames(ll) <- ll$id; ll <- ll[, -1]
+ll[ll == 0] <- NA
+ll <- ll[intersect(liv_ids, rownames(ll)), , drop = FALSE]
+desc$ID <- gsub(" ", "_", gsub("rowid_", "", paste0(desc$Family, "_", rownames(desc))))
+newn <- desc$ID[match(colnames(ll), rownames(desc))]
+colnames(ll) <- ifelse(is.na(newn), colnames(ll), newn)
+tmp <- poma_prep(ll, cutoff = 20)
+liver_lipid <- tmp$auto
+## A3. serum polar/semipolar (cutoff 20); serum IDs are liver IDs without "LIV"
+sp <- data.frame(read_excel(F_SER_POL)); sp <- data.frame(t(sp))
+colnames(sp) <- unlist(sp[1, ]); sp <- sp[-1, ]
+cn <- gsub("[^[:alnum:]_]", "_", colnames(sp)); cn <- gsub("___", "_", cn); cn <- gsub("__", "_", cn)
+colnames(sp) <- cn
+smeta <- data.frame(read_excel(F_SER_META)); rownames(smeta) <- smeta$ID
+smeta <- smeta[!is.na(smeta$steatosis_Kleiner), ]
+sp <- sp[intersect(rownames(sp), rownames(smeta)), , drop = FALSE]
+sp <- sp[, !(colnames(sp) %in% c("PFHxS", "PFNA", "PFOA", "PFOS_L", "PFOS_B")), drop = FALSE]
+sp <- sp[rownames(sp) %in% sub("LIV", "", liv_ids), , drop = FALSE]
+tmp <- poma_prep(sp, cutoff = 20)
+serum_polar_log2 <- tmp$log2; serum_polar <- tmp$auto
+rownames(serum_polar_log2) <- rownames(serum_polar) <- paste0("LIV", rownames(serum_polar))
+cat(sprintf("liver polar %d x %d | lipids %d x %d | serum polar %d x %d\n",
+            nrow(liver_polar), ncol(liver_polar), nrow(liver_lipid), ncol(liver_lipid),
+            nrow(serum_polar), ncol(serum_polar)))
+cat("expected features: liver polar 701, serum polar 653\n")
+cat("TG features in lipid data:", sum(grepl("^(TG|TAG)[ _(.]", colnames(liver_lipid), ignore.case = TRUE)), "\n")
+## ---------------------------------------------------------------------
+## helpers
+## ---------------------------------------------------------------------
+num <- function(v) suppressWarnings(as.numeric(as.character(v)))
+norm_name <- function(x) {
+    x <- toupper(x); x <- sub("^X(?=[0-9])", "", x, perl = TRUE)
+    x <- gsub("[^A-Z0-9]+", "_", x); gsub("^_+|_+$", "", x)
+}
+is_unann <- function(n) grepl("UNKNOWN|^UNK_|^FEATURE|^[0-9_]+$", n)
+pc_outlier_z <- function(X) {
+    X <- X[, colSums(is.na(X)) == 0, drop = FALSE]
+    X <- X[, apply(X, 2, sd) > 0, drop = FALSE]
+    p <- prcomp(X, scale. = TRUE)$x[, 1:5]
+    d <- sqrt(rowSums(sweep(p, 2, apply(p, 2, median))^2))
+    (d - median(d)) / mad(d)
+}
+code_col <- function(v, risk = NA) {
+    if (is.numeric(v)) return(v)
+    s <- toupper(trimws(as.character(v))); s[s %in% c("", "NA", "N/A", ".")] <- NA
+    nn <- suppressWarnings(as.numeric(s))
+    if (sum(!is.na(s)) > 0 && mean(is.na(nn[!is.na(s)])) < 0.05) return(nn)
+    if (!is.na(risk) && all(grepl("^[ACGT][/|]?[ACGT]$", s[!is.na(s)]))) {
+        out <- nchar(gsub(paste0("[^", risk, "]"), "", s)); out[is.na(s)] <- NA; return(out)
+    }
+    if (all(s[!is.na(s)] %in% c("YES", "NO", "Y", "N", "TRUE", "FALSE")))
+        return(ifelse(is.na(s), NA, as.integer(s %in% c("YES", "Y", "TRUE"))))
+    factor(s)
+}
+## limma on samples x features matrix; returns logFC, t (ordinary), partial R2, FDR
+run_limma <- function(X, df, trait, covars = character(0)) {
+    vars <- c(trait, covars)
+    d <- df[rownames(X), vars, drop = FALSE]
+    d <- d[complete.cases(d), , drop = FALSE]
+    d[[trait]] <- as.numeric(d[[trait]])
+    covars <- covars[vapply(covars, function(v) length(unique(d[[v]])) > 1, logical(1))]
+    des <- model.matrix(reformulate(c(trait, covars)), d)
+    fit <- lmFit(t(X[rownames(d), , drop = FALSE]), des)
+    t_ord <- fit$coefficients[, trait] / (fit$stdev.unscaled[, trait] * fit$sigma)
+    dfr <- fit$df.residual
+    eb <- eBayes(fit)
+    tt <- topTable(eb, coef = trait, number = Inf, sort.by = "none")
+    data.frame(feature = rownames(tt), logFC = tt$logFC, P = tt$P.Value, FDR = tt$adj.P.Val,
+               partialR2 = t_ord^2 / (t_ord^2 + dfr), n = nrow(d), row.names = NULL)
+}
+n_sig <- function(r) sum(r$FDR <= FDR, na.rm = TRUE)
+## ---------------------------------------------------------------------
+## 1. data, pairing, reproduction
+## ---------------------------------------------------------------------
+meta <- if ("steatosis_Kleiner" %in% names(phenotype)) phenotype else as.data.frame(read_excel(META_FILE))
+if ("steatosis_Kleiner" %in% names(phenotype)) meta$id <- rownames(phenotype)
+meta$id <- as.character(meta$id)
+meta$steatosis    <- as.integer(num(meta$steatosis_Kleiner) >= 1)
+meta$inflammation <- as.integer(num(meta$inflammation_Kleiner) >= 1)
+fib <- num(meta$fibrosis_Kleiner_04)
+meta$fibrosis <- as.integer(fib >= 1); meta$F2 <- as.integer(fib >= 2)
+g <- tolower(trimws(as.character(meta$Gender_M0F1)))
+meta$sex <- ifelse(g %in% c("1", "female", "f", "woman"), 1, ifelse(g %in% c("0", "male", "m", "man"), 0, NA))
+meta$age <- num(meta$Age_yr); meta$bmi <- num(meta$BMI_kgm2)
+cat("sex coding: women", sum(meta$sex == 1, na.rm = TRUE), "| men", sum(meta$sex == 0, na.rm = TRUE),
+    "| missing", sum(is.na(meta$sex)), "\n")
+stopifnot("sex could not be coded" = sum(is.na(meta$sex)) == 0)
+mash_col <- grep("MASH|NASH|definite", names(meta), ignore.case = TRUE, value = TRUE)
+bal_col  <- grep("balloon", names(meta), ignore.case = TRUE, value = TRUE)
+if (length(mash_col)) {
+    v <- meta[[mash_col[1]]]
+    meta$MASH <- if (is.numeric(v)) as.integer(v >= 1) else
+        as.integer(grepl("^(1|yes|y|true|mash|nash|definite)", tolower(trimws(v))))
+} else if (length(bal_col)) {
+    meta$MASH <- as.integer(meta$steatosis == 1 & meta$inflammation == 1 & num(meta[[bal_col[1]]]) >= 1)
+} else meta$MASH <- NA
+cat("MASH source:", if (length(mash_col)) mash_col[1] else if (length(bal_col)) "derived S+I+B" else "none",
+    "| MASH n =", sum(meta$MASH == 1, na.rm = TRUE), "(Table 1: 87)\n")
+cat("fibrosis F0 vs F1-F4: F0 =", sum(meta$fibrosis == 0, na.rm = TRUE),
+    "| F1-F4 =", sum(meta$fibrosis == 1, na.rm = TRUE), "\n")
+## matrices built in section A (autoscaled = as in the manuscript; *_log = log2 before scaling)
+Lp <- liver_polar; Lp_log <- liver_polar_log2
+Sp <- serum_polar; Sp_log <- serum_polar_log2
+Ll <- liver_lipid
+cat(sprintf("liver polar %d x %d | serum polar %d x %d | liver lipid %d x %d\n",
+            nrow(Lp), ncol(Lp), nrow(Sp), ncol(Sp), nrow(Ll), ncol(Ll)))
+cat("IDs matching metadata: liver", sum(rownames(Lp) %in% meta$id),
+    "| serum", sum(rownames(Sp) %in% meta$id), "| lipid", sum(rownames(Ll) %in% meta$id), "\n")
+paired <- Reduce(intersect, list(rownames(Lp), rownames(Sp), meta$id))
+stopifnot("fewer than 150 paired participants – check sample IDs (liver LIVMFxxx, serum MFxxx)" = length(paired) >= 150)
+if (is.null(EXCLUDE_IDS)) {
+    zl <- pc_outlier_z(Lp[paired, ]); zs <- pc_outlier_z(Sp[paired, ])
+    cat("largest PCA distances (MAD units) liver:", round(head(sort(zl, TRUE), 3), 1),
+        "| serum:", round(head(sort(zs, TRUE), 3), 1), "\n")
+    EXCLUDE_IDS <- union(names(zl)[zl > 10], names(zs)[zs > 10])
+}
+cat("excluded:", if (length(EXCLUDE_IDS)) EXCLUDE_IDS else "none", "\n")
+paired <- setdiff(paired, EXCLUDE_IDS)
+df <- meta[match(paired, meta$id), ]; rownames(df) <- paired
+## matched panel
+nl <- norm_name(colnames(Lp)); ns <- norm_name(colnames(Sp))
+okL <- !is_unann(nl) & !(nl %in% nl[duplicated(nl)])
+okS <- !is_unann(ns) & !(ns %in% ns[duplicated(ns)])
+panel <- sort(intersect(nl[okL], ns[okS]))
+Lm <- Lp[paired, match(panel, nl), drop = FALSE]; colnames(Lm) <- panel
+Sm <- Sp[paired, match(panel, ns), drop = FALSE]; colnames(Sm) <- panel
+rho <- sapply(panel, function(m) suppressWarnings(
+    cor.test(Lm[, m], Sm[, m], method = "spearman", exact = FALSE)[c("estimate", "p.value")]))
+rho <- data.frame(metabolite = panel, rho = unlist(rho[1, ]), p = unlist(rho[2, ]))
+rho$FDR <- p.adjust(rho$p, "BH")
+BASE <- c("age", "sex", "bmi")
+TRAITS <- c("steatosis", "inflammation")
+hep0 <- lapply(setNames(TRAITS, TRAITS), function(t) run_limma(Lp[paired, ], df, t, BASE))
+ser0 <- lapply(setNames(TRAITS, TRAITS), function(t) run_limma(Sp[paired, ], df, t, BASE))
+zL <- scale(Lm); zS <- scale(Sm); D <- zL - zS
+diff0 <- lapply(setNames(TRAITS, TRAITS), function(t) run_limma(D, df, t, BASE))
+repro <- data.frame(
+    check    = c("paired n", "matched metabolites", "median liver-serum rho", "rho FDR<=0.10",
+                 "hepatic hits steatosis", "hepatic hits inflammation",
+                 "serum hits steatosis", "serum hits inflammation",
+                 "discordant steatosis", "discordant inflammation"),
+    expected = c(187, 40, 0.020, 9, 116, 216, 1, 0, 3, 6),
+    obtained = c(length(paired), length(panel), round(median(rho$rho), 3), sum(rho$FDR <= FDR),
+                 n_sig(hep0$steatosis), n_sig(hep0$inflammation),
+                 n_sig(ser0$steatosis), n_sig(ser0$inflammation),
+                 n_sig(diff0$steatosis), n_sig(diff0$inflammation)))
+print(repro, row.names = FALSE)
+write.csv(repro, file.path(OUT, "1_reproduction_check.csv"), row.names = FALSE)
+if (any(abs(repro$obtained - repro$expected) > c(0, 0, 0.01, 1, 5, 5, 1, 1, 1, 1)))
+    cat("\n*** Reproduction differs from the manuscript – see 1_reproduction_check.csv",
+        "before interpreting anything else. ***\n\n")
+## ---------------------------------------------------------------------
+## 1b. TABLE S7 – paired correlations (A) and liver vs serum effects (B)
+## ---------------------------------------------------------------------
+BILE_ACIDS  <- c("GCA","GCDCA","GDCA","GHDCA","TCA","TCDCA","TDCA","CDCA","DCA","LCA",
+                 "HDCA","ALLO_DCA","CA","UDCA","GUDCA","TUDCA","GLCA","TLCA","THDCA")
+AMINO_ACIDS <- c("GLUTAMIC_ACID","GLUTAMINE","LYSINE","METHIONINE","PHENYLALANINE","PROLINE",
+                 "SERINE","THREONINE","TRYPTOPHAN","TYROSINE","VALINE","ASPARTIC_ACID",
+                 "ALANINE","GLYCINE","LEUCINE","ISOLEUCINE","HISTIDINE","ARGININE","ASPARAGINE")
+class_of <- function(x) ifelse(x %in% BILE_ACIDS, "Bile acid",
+                               ifelse(x %in% AMINO_ACIDS, "Amino acid", "Other"))
+ABBR <- c(BILE_ACIDS, "TMAO", "GABA", "SAM", "SAH", "NAD", "NADP", "AMP", "ADP", "ATP",
+          "GMP", "IMP", "UMP", "CMP", "DMG")
+pretty_met <- function(x) {
+    y <- tolower(gsub("_", " ", x))
+    out <- ifelse(x %in% ABBR, gsub("_", "-", x), paste0(toupper(substr(y, 1, 1)), substring(y, 2)))
+    out <- sub("^([0-9]+) ", "\\1-", out)
+    out <- sub("^P cresol", "p-Cresol", out)
+    out <- sub("^Cis 8 11 14 17 eicosatetraenoic acid$", "Eicosatetraenoic acid", out)
+    out <- sub("^Trans ", "trans-", out); sub("^Cis ", "cis-", out)
+}
+s7a <- data.frame(Metabolite = pretty_met(rho$metabolite), ID = rho$metabolite,
+                  Class = class_of(rho$metabolite), N_pairs = length(paired),
+                  Spearman_rho = round(rho$rho, 3), P = signif(rho$p, 3), FDR = signif(rho$FDR, 3))
+s7a <- s7a[order(-s7a$Spearman_rho), ]
+s7b_tab <- do.call(rbind, lapply(TRAITS, function(t) {
+    hl <- hep0[[t]]; hs <- ser0[[t]]; dd <- diff0[[t]]
+    iL <- match(panel, norm_name(hl$feature)); iS <- match(panel, norm_name(hs$feature))
+    iD <- match(panel, dd$feature);             iR <- match(panel, rho$metabolite)
+    data.frame(Phenotype = c(steatosis = "Steatosis", inflammation = "Inflammation")[[t]],
+               Metabolite = pretty_met(panel), ID = panel, Class = class_of(panel), N = hl$n[1],
+               Liver_log2FC = round(hl$logFC[iL], 3), Liver_FDR = signif(hl$FDR[iL], 3),
+               Serum_log2FC = round(hs$logFC[iS], 3), Serum_FDR = signif(hs$FDR[iS], 3),
+               Difference_log2FC = round(dd$logFC[iD], 3), Difference_FDR = signif(dd$FDR[iD], 3),
+               Opposite_sign = sign(hl$logFC[iL]) != sign(hs$logFC[iS]),
+               Liver_serum_rho = round(rho$rho[iR], 3), rho_FDR = signif(rho$FDR[iR], 3))
+}))
+stopifnot(nrow(s7b_tab) == 2 * length(panel), !anyNA(s7b_tab$Liver_log2FC), !anyNA(s7b_tab$Serum_log2FC))
+wb7 <- createWorkbook()
+addWorksheet(wb7, "S7A_correlations"); writeData(wb7, 1, s7a)
+addWorksheet(wb7, "S7B_liver_vs_serum"); writeData(wb7, 2, s7b_tab)
+saveWorkbook(wb7, file.path(OUT, "Table_S7_reanalysis.xlsx"), overwrite = TRUE)
+cat("\n== Table S7 ==\n")
+cat(sprintf("paired n = %d | matched metabolites = %d | median rho = %.3f (IQR %.3f to %.3f) | rho FDR<=0.10: %d\n",
+            length(paired), length(panel), median(rho$rho), quantile(rho$rho, .25), quantile(rho$rho, .75),
+            sum(rho$FDR <= FDR)))
+for (ph in unique(s7b_tab$Phenotype)) {
+    d <- s7b_tab[s7b_tab$Phenotype == ph, ]
+    cat(sprintf("%-12s discordant (difference FDR<=0.10): %d  -> %s\n", ph, sum(d$Difference_FDR <= FDR),
+                paste(d$Metabolite[d$Difference_FDR <= FDR], collapse = ", ")))
+}
+## ---------------------------------------------------------------------
+## 2. steatosis dilution check (liver side)
+## ---------------------------------------------------------------------
+tg_cols <- grep("^(TG|TAG)[ _(.]", colnames(Ll), ignore.case = TRUE)
+if (length(tg_cols) >= 5) {
+    df$TG_index <- rowMeans(scale(Ll[, tg_cols]), na.rm = TRUE)[paired]
+    cat("TG index from", length(tg_cols), "triacylglycerol features\n")
+} else if (exists("lipidomics_MEs")) {
+    me <- as.matrix(lipidomics_MEs); if (nrow(me) < ncol(me)) me <- t(me)
+    lc1 <- grep("(^|_)(LC_?)?1$|ME1$", colnames(me), value = TRUE)[1]
+    df$TG_index <- me[paired, lc1]; cat("TG index = lipid module", lc1, "\n")
+} else stop("no TG features found in LIVER_LIPID and no lipidomics_MEs – set TG_index manually")
+cat("TG index vs steatosis (Spearman):",
+    round(cor(df$TG_index, df$steatosis, method = "spearman", use = "complete"), 2), "\n")
+## sample dilution factor (log-scale PQN): median deviation from the feature reference
+dil_factor <- function(X) { ref <- apply(X, 2, median, na.rm = TRUE)
+apply(sweep(X, 2, ref), 1, median, na.rm = TRUE) }
+## computed on log2 data (before autoscaling): PQN in log space
+df$dil_liver <- dil_factor(Lp_log[paired, ])
+df$dil_serum <- dil_factor(Sp_log[paired, ])
+Lp_pqn <- scale(sweep(Lp_log[paired, ], 1, df$dil_liver))   # dilution-normalized, then autoscaled
+cat("dilution factor vs TG index (Spearman):",
+    round(cor(df$dil_liver, df$TG_index, method = "spearman", use = "complete"), 2), "\n")
+## lipid-like polar features: |rho| with TG index > 0.5
+r_tg <- apply(Lp[paired, ], 2, function(v) suppressWarnings(cor(v, df$TG_index, method = "spearman", use = "complete")))
+lipid_like <- names(r_tg)[abs(r_tg) > 0.5 & !is.na(r_tg)]
+cat("hepatic polar features with |rho| > 0.5 vs TG index:", length(lipid_like), "of", ncol(Lp), "\n")
+## ---------------------------------------------------------------------
+## 3. confounders
+## ---------------------------------------------------------------------
+pat <- c(diabetes = "diab|t2d|^dm$|dm2|t2dm", metformin = "metformin", statin = "statin",
+         glp1 = "glp|semaglut|liraglut|dulaglut", insulin_tx = "insulin.*(tx|treat|therap|use)",
+         PNPLA3 = "pnpla3|rs738409", TM6SF2 = "tm6sf2|rs58542926")
+risk <- c(PNPLA3 = "G", TM6SF2 = "T")
+cand <- lapply(pat, function(p) grep(p, names(meta), ignore.case = TRUE, value = TRUE))
+cat("\nconfounder candidates in metadata:\n"); print(cand[lengths(cand) > 0])
+if (is.null(EXTRA_COVARS)) EXTRA_COVARS <- unname(vapply(cand[lengths(cand) > 0], `[`, "", 1))
+extra_ok <- character(0)
+for (v in EXTRA_COVARS) {
+    key <- names(pat)[vapply(pat, function(p) grepl(p, v, ignore.case = TRUE), logical(1))][1]
+    newv <- paste0("cf_", make.names(v))
+    df[[newv]] <- code_col(meta[[v]][match(paired, meta$id)], if (!is.na(key) && key %in% names(risk)) risk[[key]] else NA)
+    miss <- mean(is.na(df[[newv]]))
+    cat(sprintf("  %-25s missing %4.1f%%  %s\n", v, 100 * miss,
+                if (miss <= 0.2) "-> used" else "-> dropped (>20% missing)"))
+    if (miss <= 0.2) extra_ok <- c(extra_ok, newv)
+}
+if (!length(extra_ok)) cat("  no extra confounders available – model 'confounders' = base\n")
+## ---------------------------------------------------------------------
+## run all model variants
+## ---------------------------------------------------------------------
+variants <- list(
+    base            = list(Xl = Lp[paired, ], cov_l = BASE, cov_s = BASE),
+    TG_adjusted     = list(Xl = Lp[paired, ], cov_l = c(BASE, "TG_index"), cov_s = c(BASE, "TG_index")),
+    dilution_adj    = list(Xl = Lp[paired, ], cov_l = c(BASE, "dil_liver"), cov_s = c(BASE, "dil_serum")),
+    PQN_normalised  = list(Xl = Lp_pqn,       cov_l = BASE, cov_s = BASE),
+    confounders     = list(Xl = Lp[paired, ], cov_l = c(BASE, extra_ok), cov_s = c(BASE, extra_ok)),
+    TG_plus_confounders = list(Xl = Lp[paired, ], cov_l = c(BASE, "TG_index", extra_ok),
+                               cov_s = c(BASE, "TG_index", extra_ok)))
+AA <- intersect(c("LYSINE", "GLUTAMIC_ACID", "VALINE", "TRYPTOPHAN", "TYROSINE", "PHENYLALANINE",
+                  "METHIONINE", "SERINE", "THREONINE", "GLUTAMINE", "PROLINE", "ASPARTIC_ACID",
+                  "LEUCINE", "ISOLEUCINE", "ALANINE", "GLYCINE", "HISTIDINE", "ARGININE"), panel)
+KEY6 <- c("LYSINE", "GLUTAMIC_ACID", "VALINE", "TRYPTOPHAN", "TYROSINE", "PHENYLALANINE")
+counts <- list(); aa_tab <- list(); disc_tab <- list()
+for (vn in names(variants)) for (t in TRAITS) {
+    vv <- variants[[vn]]
+    extra_t <- if (t == "inflammation") list(NULL, "steatosis") else list(NULL)
+    for (adj in extra_t) {
+        lab <- paste0(vn, if (!is.null(adj)) "+steatosis" else "")
+        hl <- run_limma(vv$Xl, df, t, c(vv$cov_l, adj))
+        hs <- run_limma(Sp[paired, ], df, t, c(vv$cov_s, adj))
+        hl_nolipid <- hl[!hl$feature %in% lipid_like, ]
+        hl_nolipid$FDR <- p.adjust(hl_nolipid$P, "BH")
+        ## paired difference on matched panel (liver side normalised as in the variant)
+        XlM <- vv$Xl[paired, match(panel, nl), drop = FALSE]; colnames(XlM) <- panel
+        Dv <- scale(XlM) - zS
+        dd <- run_limma(Dv, df, t, c(vv$cov_l, adj))
+        counts[[length(counts) + 1]] <- data.frame(
+            model = lab, trait = t, n = hl$n[1],
+            hepatic_sig = n_sig(hl), hepatic_tested = nrow(hl),
+            hepatic_sig_excl_lipidlike = n_sig(hl_nolipid), hepatic_tested_excl_lipidlike = nrow(hl_nolipid),
+            serum_sig = n_sig(hs), serum_tested = nrow(hs), serum_min_FDR = signif(min(hs$FDR), 3),
+            hepatic_median_partialR2 = signif(median(hl$partialR2, na.rm = TRUE), 3),
+            serum_median_partialR2   = signif(median(hs$partialR2, na.rm = TRUE), 3),
+            hepatic_p90_partialR2 = signif(quantile(hl$partialR2, 0.9, na.rm = TRUE), 3),
+            serum_p90_partialR2   = signif(quantile(hs$partialR2, 0.9, na.rm = TRUE), 3),
+            discordant = n_sig(dd),
+            discordant_list = paste(dd$feature[dd$FDR <= FDR], collapse = ";"),
+            key6_discordant = sum(dd$FDR[dd$feature %in% KEY6] <= FDR))
+        idxL <- match(AA, norm_name(hl$feature)); idxS <- match(AA, norm_name(hs$feature))
+        aa_tab[[length(aa_tab) + 1]] <- data.frame(
+            model = lab, trait = t, metabolite = AA,
+            liver_logFC = round(hl$logFC[idxL], 3), liver_FDR = signif(hl$FDR[idxL], 3),
+            serum_logFC = round(hs$logFC[idxS], 3), serum_FDR = signif(hs$FDR[idxS], 3),
+            diff_logFC = round(dd$logFC[match(AA, dd$feature)], 3),
+            diff_FDR = signif(dd$FDR[match(AA, dd$feature)], 3))
+    }
+}
+counts <- do.call(rbind, counts); aa_tab <- do.call(rbind, aa_tab)
+write.csv(counts, file.path(OUT, "2_counts_by_model.csv"), row.names = FALSE)
+write.csv(aa_tab, file.path(OUT, "3_amino_acids_by_model.csv"), row.names = FALSE)
+cat("\n== hepatic vs serum hits and discordant metabolites by model ==\n")
+print(counts[, c("model", "trait", "n", "hepatic_sig", "hepatic_sig_excl_lipidlike",
+                 "serum_sig", "discordant", "key6_discordant")], row.names = FALSE)
+## ---------------------------------------------------------------------
+## 4. effect sizes on the matched panel (z-scored, base model)
+## ---------------------------------------------------------------------
+es <- do.call(rbind, lapply(TRAITS, function(t) {
+    a <- run_limma(zL, df, t, BASE); b <- run_limma(zS, df, t, BASE)
+    data.frame(trait = t, metabolite = a$feature,
+               liver_SMD = round(a$logFC, 3), serum_SMD = round(b$logFC[match(a$feature, b$feature)], 3),
+               liver_partialR2 = round(a$partialR2, 4),
+               serum_partialR2 = round(b$partialR2[match(a$feature, b$feature)], 4))
+}))
+es_sum <- do.call(rbind, lapply(TRAITS, function(t) {
+    e <- es[es$trait == t, ]
+    data.frame(trait = t,
+               median_abs_SMD_liver = round(median(abs(e$liver_SMD)), 3),
+               median_abs_SMD_serum = round(median(abs(e$serum_SMD)), 3),
+               n_absSMD_gt0.3_liver = sum(abs(e$liver_SMD) > 0.3),
+               n_absSMD_gt0.3_serum = sum(abs(e$serum_SMD) > 0.3),
+               wilcoxon_p_paired = signif(wilcox.test(abs(e$liver_SMD), abs(e$serum_SMD), paired = TRUE)$p.value, 3),
+               median_partialR2_liver = round(median(e$liver_partialR2), 4),
+               median_partialR2_serum = round(median(e$serum_partialR2), 4))
+}))
+write.csv(es, file.path(OUT, "4_effect_sizes_matched_panel.csv"), row.names = FALSE)
+write.csv(es_sum, file.path(OUT, "4_effect_size_summary.csv"), row.names = FALSE)
+cat("\n== effect sizes on matched panel ==\n"); print(es_sum, row.names = FALSE)
+## ---------------------------------------------------------------------
+## 5. cross-validated AUC (elastic net, repeated stratified CV)
+## ---------------------------------------------------------------------
+fit_predict <- function(Xtr, ytr, Xte, pf) {
+    med <- apply(Xtr, 2, median, na.rm = TRUE)
+    Xtr[is.na(Xtr)] <- med[col(Xtr)][is.na(Xtr)]; Xte[is.na(Xte)] <- med[col(Xte)][is.na(Xte)]
+    keep <- apply(Xtr, 2, sd) > 0; Xtr <- Xtr[, keep, drop = FALSE]; Xte <- Xte[, keep, drop = FALSE]
+    pf <- pf[keep]
+    if (ncol(Xtr) < 2 || all(pf == 0)) {
+        d <- data.frame(y = ytr, Xtr); m <- suppressWarnings(glm(y ~ ., data = d, family = binomial))
+        return(as.numeric(predict(m, data.frame(Xte), type = "response")))
+    }
+    cvf <- cv.glmnet(Xtr, ytr, family = "binomial", alpha = 0.5, nfolds = 5, penalty.factor = pf)
+    as.numeric(predict(cvf, Xte, s = "lambda.min", type = "response"))
+}
+cv_auc <- function(X, y, pf) {
+    aucs <- numeric(N_REP); oof <- matrix(NA, length(y), N_REP)
+    for (r in seq_len(N_REP)) {
+        set.seed(1000 + r)
+        folds <- integer(length(y))
+        for (cl in 0:1) { i <- which(y == cl); folds[i] <- sample(rep_len(seq_len(N_FOLD), length(i))) }
+        for (f in seq_len(N_FOLD)) {
+            set.seed(100 * r + f); te <- folds == f
+            oof[te, r] <- fit_predict(X[!te, , drop = FALSE], y[!te], X[te, , drop = FALSE], pf)
+        }
+        aucs[r] <- as.numeric(auc(y, oof[, r], levels = c(0, 1), direction = "<", quiet = TRUE))
+    }
+    list(auc = aucs, oof = rowMeans(oof))
+}
+AUC_FILE <- file.path(OUT, "5_cv_auc.csv"); CMP_FILE <- file.path(OUT, "5_cv_auc_comparisons.csv")
+read_auc_from_table <- function(xlsx, sheet) {
+    raw <- openxlsx::read.xlsx(xlsx, sheet = sheet, colNames = FALSE, skipEmptyRows = FALSE)
+    a <- trimws(as.character(raw[[1]]))
+    i_d <- grep("^\\(d\\)", a); i_e <- grep("^\\(e\\)", a)
+    stopifnot("sections (d) and (e) not found" = length(i_d) == 1, length(i_e) == 1)
+    blk <- function(from, to) {
+        x <- raw[(from + 1):to, , drop = FALSE]
+        x <- x[!is.na(x[[1]]) & trimws(x[[1]]) != "", , drop = FALSE]
+        x[!grepl("^Outcome$", trimws(x[[1]])), , drop = FALSE]          # drop header row
+    }
+    d <- blk(i_d, i_e - 1); e <- blk(i_e, nrow(raw))
+    key_out <- function(v) { v <- tolower(trimws(v))
+    ifelse(grepl("steat", v), "steatosis", ifelse(grepl("inflam", v), "inflammation",
+                                                  ifelse(grepl("mash", v), "MASH", ifelse(grepl("fibro", v), "fibrosis", NA)))) }
+    key_pred <- function(v) { v <- tolower(gsub("\\s+", " ", trimws(v)))
+    ifelse(v == "clinical", "clinical",
+           ifelse(grepl("^clinical.*serum", v), "clinical_plus_serum",
+                  ifelse(grepl("^clinical.*liver", v), "clinical_plus_liver",
+                         ifelse(grepl("serum.*40", v), "serum_matched40", ifelse(grepl("liver.*40", v), "liver_matched40",
+                                                                                 ifelse(grepl("serum.*all", v), "serum_all", ifelse(grepl("liver.*all", v), "liver_all", NA))))))) }
+    key_cmp <- function(v) { v <- tolower(trimws(v))
+    ifelse(grepl("clinical.*serum.*vs", v), "clinical_plus_serum vs clinical",
+           ifelse(grepl("clinical.*liver.*vs", v), "clinical_plus_liver vs clinical",
+                  ifelse(grepl("all features vs", v), "liver_all vs serum_all",
+                         ifelse(grepl("40 matched vs", v), "liver_matched40 vs serum_matched40", NA)))) }
+  nums <- regmatches(as.character(d[[6]]), gregexpr("[0-9]*\\.[0-9]+", as.character(d[[6]])))
+  rng  <- lapply(nums, function(z) if (length(z) >= 2) z[1:2] else c(NA, NA))
+  auc <- data.frame(outcome = key_out(d[[1]]), n = as.numeric(d[[3]]), cases = as.numeric(d[[4]]),
+                      predictors = key_pred(d[[2]]), AUC_mean = as.numeric(d[[5]]),
+                      AUC_min_rep = as.numeric(sapply(rng, `[`, 1)),
+                      AUC_max_rep = as.numeric(sapply(rng, `[`, 2)))
+    cmp <- data.frame(outcome = key_out(e[[1]]), comparison = key_cmp(e[[2]]),
+                      mean_AUC_difference = as.numeric(e[[3]]),
+                      repeats_favouring_first = as.numeric(e[[4]]),
+                      DeLong_p_on_averaged_OOF = as.numeric(e[[5]]))
+    bad_a <- d[is.na(auc$outcome) | is.na(auc$predictors), 1:2]
+    bad_c <- e[is.na(cmp$outcome) | is.na(cmp$comparison), 1:2]
+    if (nrow(bad_a) || nrow(bad_c)) { print(bad_a); print(bad_c); stop("unrecognised labels (printed above)") }
+    stopifnot("expected 28 AUC rows and 16 comparisons" = nrow(auc) == 28, nrow(cmp) == 16)
+    list(auc = auc, cmp = cmp)
+}
+if (AUC_SOURCE == "table") {
+    tt <- read_auc_from_table(TABLES_XLSX, AUC_SHEET)
+    auc_tab <- tt$auc; cmp_tab <- tt$cmp
+    cat("\nPanel d uses Table S11d–e from", TABLES_XLSX, "\n")
+    print(auc_tab, row.names = FALSE); print(cmp_tab, row.names = FALSE)
+} else if (AUC_SOURCE == "reuse" && file.exists(AUC_FILE) && file.exists(CMP_FILE)) {
+    auc_tab <- read.csv(AUC_FILE); cmp_tab <- read.csv(CMP_FILE)
+    cat("\nReusing AUC results from", AUC_FILE, "\n")
+} else {
+    clin_df <- df[, c("age", "sex", "bmi", extra_ok), drop = FALSE]
+    mf_clin <- model.frame(~ ., data = clin_df, na.action = na.pass)
+    Xclin <- model.matrix(attr(mf_clin, "terms"), mf_clin)[, -1, drop = FALSE]
+    rownames(Xclin) <- rownames(clin_df)
+    OUTCOMES <- c("steatosis", "inflammation", "MASH", "fibrosis")   # fibrosis = F0 vs F1-F4
+    cat("clinical predictors:", paste(colnames(Xclin), collapse = ", "), "\n")
+    auc_rows <- list(); cmp_rows <- list()
+    for (o in OUTCOMES) {
+        y <- df[[o]]
+        ok <- !is.na(y) & complete.cases(Xclin)
+        if (sum(y[ok] == 1) < 15 || sum(y[ok] == 0) < 15) { cat("skip", o, "(too few cases)\n"); next }
+        y <- y[ok]; nc <- ncol(Xclin)
+        sets <- list(
+            clinical            = list(X = Xclin[ok, , drop = FALSE], pf = rep(0, nc)),
+            serum_matched40     = list(X = Sm[ok, ], pf = rep(1, ncol(Sm))),
+            liver_matched40     = list(X = Lm[ok, ], pf = rep(1, ncol(Lm))),
+            serum_all           = list(X = Sp[paired, ][ok, ], pf = rep(1, ncol(Sp))),
+            liver_all           = list(X = Lp[paired, ][ok, ], pf = rep(1, ncol(Lp))),
+            clinical_plus_serum = list(X = cbind(Xclin[ok, , drop = FALSE], Sp[paired, ][ok, ]), pf = c(rep(0, nc), rep(1, ncol(Sp)))),
+            clinical_plus_liver = list(X = cbind(Xclin[ok, , drop = FALSE], Lp[paired, ][ok, ]), pf = c(rep(0, nc), rep(1, ncol(Lp)))))
+        cat("AUC:", o, "(n =", length(y), ", cases =", sum(y), ")\n")
+        res <- lapply(sets, function(s) cv_auc(s$X, y, s$pf))
+        for (sn in names(res)) auc_rows[[length(auc_rows) + 1]] <- data.frame(
+            outcome = o, n = length(y), cases = sum(y), predictors = sn,
+            AUC_mean = round(mean(res[[sn]]$auc), 3),
+            AUC_min_rep = round(min(res[[sn]]$auc), 3), AUC_max_rep = round(max(res[[sn]]$auc), 3))
+        cmp <- list(c("liver_all", "serum_all"), c("liver_matched40", "serum_matched40"),
+                    c("clinical_plus_serum", "clinical"), c("clinical_plus_liver", "clinical"))
+        for (cc in cmp) {
+            rt <- roc.test(roc(y, res[[cc[1]]]$oof, levels = c(0, 1), direction = "<", quiet = TRUE),
+                           roc(y, res[[cc[2]]]$oof, levels = c(0, 1), direction = "<", quiet = TRUE),
+                           method = "delong", paired = TRUE)
+            cmp_rows[[length(cmp_rows) + 1]] <- data.frame(
+                outcome = o, comparison = paste(cc, collapse = " vs "),
+                mean_AUC_difference = round(mean(res[[cc[1]]]$auc - res[[cc[2]]]$auc), 3),
+                repeats_favouring_first = sum(res[[cc[1]]]$auc > res[[cc[2]]]$auc),
+                DeLong_p_on_averaged_OOF = signif(rt$p.value, 3))
+        }
+    }
+    auc_tab <- do.call(rbind, auc_rows); cmp_tab <- do.call(rbind, cmp_rows)
+    write.csv(auc_tab, file.path(OUT, "5_cv_auc.csv"), row.names = FALSE)
+    write.csv(cmp_tab, file.path(OUT, "5_cv_auc_comparisons.csv"), row.names = FALSE)
+    cat("\n== cross-validated AUC ==\n"); print(auc_tab, row.names = FALSE); print(cmp_tab, row.names = FALSE)
+}
+## #####################################################################
+## 6. FIGURE 4
+## #####################################################################
+FIG_W <- 183; FIG_H <- 225                  # mm (Nature double column, 183 mm wide)
+## ---- design tokens ----------------------------------------------------
+FONT <- "Helvetica"                         # use "Arial" on Windows
+CLASS_COL <- c(`Amino acid` = "#4a3aa7", `Bile acid` = "#eda100", Other = "#a3a29b")
+LIVER <- "#2a78d6"; SERUM <- "#eb6834"; CLIN <- "#8d8c86"
+INK <- "#1a1a1a"; INK2 <- "#4d4c47"; MUTED <- "#9a9993"; GRID <- "#ecebe6"; SHADE <- "#efedfa"
+TXT <- 2.3                                  # geom_text size (mm) ~ 6.5 pt
+theme_nat <- function(base = 7) {
+    theme_classic(base_size = base, base_family = FONT) +
+        theme(axis.line = element_line(colour = INK, linewidth = 0.3),
+              axis.ticks = element_line(colour = INK, linewidth = 0.3),
+              axis.ticks.length = unit(1, "mm"),
+              axis.text = element_text(colour = INK2, size = base - 0.5),
+              axis.title = element_text(colour = INK, size = base),
+              legend.title = element_blank(),
+              legend.text = element_text(size = base - 0.5, colour = INK),
+              legend.key.size = unit(3, "mm"),
+              legend.margin = margin(0, 0, 0, 0), legend.box.spacing = unit(1.5, "mm"),
+              legend.background = element_blank(),
+              strip.background = element_blank(),
+              strip.text = element_text(face = "bold", size = base, colour = INK, hjust = 0,
+                                        margin = margin(0, 0, 2, 0)),
+              plot.caption = element_text(size = base - 1, colour = INK2, hjust = 0),
+              plot.caption.position = "plot",
+              plot.margin = margin(4, 6, 4, 4))
+}
+AA3 <- c(lysine = "Lys", `glutamic acid` = "Glu", valine = "Val", tryptophan = "Trp",
+         tyrosine = "Tyr", phenylalanine = "Phe", leucine = "Leu", isoleucine = "Ile",
+         alanine = "Ala", glycine = "Gly", serine = "Ser", threonine = "Thr", methionine = "Met",
+         proline = "Pro", histidine = "His", arginine = "Arg", asparagine = "Asn",
+         `aspartic acid` = "Asp", glutamine = "Gln")
+fmt_d <- function(x) vapply(x, function(v) { v <- round(v, 2); if (v == 0) "0.00" else sub("-", "−", sprintf("%+.2f", v)) }, "")
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", paste("=", formatC(p, format = "f", digits = 2)))
+## data for the figure = Table S7B computed above
+s7b <- s7b_tab %>%
+    transmute(trait = Phenotype, metabolite = ID, name = Metabolite,
+              class = factor(Class, levels = names(CLASS_COL)),
+              liver = Liver_log2FC, serum = Serum_log2FC, diff_fdr = Difference_FDR,
+              rho = Liver_serum_rho, rho_fdr = rho_FDR)
+N_PAIRED <- length(paired)
+## =====================================================================
+## a. all 40 metabolites, ranked by liver–serum rho (Fisher 95% CI)
+## =====================================================================
+ra <- s7b %>% distinct(metabolite, .keep_all = TRUE) %>%
+    mutate(se = 1 / sqrt(N_PAIRED - 3),
+           lo = tanh(atanh(rho) - 1.96 * se), hi = tanh(atanh(rho) + 1.96 * se),
+           sig = rho_fdr <= 0.10,
+           fill = ifelse(sig, CLASS_COL[as.character(class)], "white")) %>%
+    arrange(rho) %>% mutate(name = factor(name, levels = name))
+med <- median(ra$rho)
+pa <- ggplot(ra, aes(rho, name)) +
+    geom_vline(xintercept = 0, colour = INK, linewidth = 0.3) +
+    geom_vline(xintercept = med, colour = MUTED, linewidth = 0.3, linetype = "22") +
+    annotate("text", x = med + 0.02, y = nrow(ra) + 1.3, label = sprintf("median ρ = %.2f", med),
+             hjust = 0, size = TXT, colour = INK2, family = FONT) +
+    geom_linerange(aes(xmin = lo, xmax = hi, colour = class), linewidth = 0.4, alpha = 0.6) +
+    geom_point(aes(colour = class, fill = fill), shape = 21, size = 1.7, stroke = 0.5) +
+    scale_fill_identity() +
+    scale_colour_manual(values = CLASS_COL,
+                        guide = guide_legend(ncol = 1, override.aes = list(fill = CLASS_COL, alpha = 1))) +
+    scale_x_continuous(breaks = seq(-0.4, 0.6, 0.2),
+                       labels = label_number(accuracy = 0.1, style_negative = "minus")) +
+    coord_cartesian(xlim = c(min(-0.4, min(ra$lo) - 0.02), max(0.7, max(ra$hi) + 0.02))) +
+    scale_y_discrete(expand = expansion(add = c(0.7, 2.2))) +
+    labs(x = "Liver–serum Spearman ρ (95% CI)", y = NULL,
+         caption = "Filled, FDR ≤ 0.10; open, not significant") +
+    theme_nat() + theme(legend.position = "inside", legend.position.inside = c(0.99, 0.01),
+                        legend.justification = c(1, 0),
+                        legend.background = element_rect(fill = "white", colour = NA),
+                        axis.text.y = element_text(size = 6, colour = INK),
+                        axis.ticks.y = element_blank(), axis.line.y = element_blank(),
+                        panel.grid.major.y = element_line(colour = GRID, linewidth = 0.2))
+## =====================================================================
+## b. histology effect: liver (x) vs serum (y)
+## =====================================================================
+## panel b = standardized mean differences on the matched panel (Table S11b), as in the legend
+es_b <- es %>% transmute(trait = c(steatosis = "Steatosis", inflammation = "Inflammation")[trait],
+                         metabolite, liver_smd = liver_SMD, serum_smd = serum_SMD)
+rb <- s7b %>% left_join(es_b, by = c("trait", "metabolite")) %>%
+    mutate(liver = liver_smd, serum = serum_smd) %>%
+    mutate(trait = factor(trait, levels = c("Steatosis", "Inflammation"),
+                          labels = c("Steatosis", "Lobular inflammation")),
+           disc = diff_fdr <= 0.10,
+           code = ifelse(tolower(name) %in% names(AA3), AA3[tolower(name)], name))
+stopifnot("panel b: SMD missing for some metabolites" = !anyNA(rb$liver), !anyNA(rb$serum))
+L <- ceiling((max(abs(c(rb$liver, rb$serum))) + 0.08) * 10) / 10
+pb <- ggplot(rb, aes(liver, serum)) +
+    annotate("rect", xmin = -Inf, xmax = 0, ymin = 0, ymax = Inf, fill = SHADE) +
+    annotate("text", x = -L + 0.03, y = L - 0.03, label = "Liver ↓  Serum ↑", hjust = 0, vjust = 1,
+             size = TXT, colour = "#5a50b0", family = FONT, fontface = "italic") +
+    geom_hline(yintercept = 0, colour = INK2, linewidth = 0.25) +
+    geom_vline(xintercept = 0, colour = INK2, linewidth = 0.25) +
+    geom_abline(slope = 1, intercept = 0, colour = MUTED, linewidth = 0.3, linetype = "22") +
+    geom_point(data = filter(rb, !disc), aes(fill = class), shape = 21, size = 1.5,
+               colour = "white", stroke = 0.2, alpha = 0.7) +
+    geom_point(data = filter(rb, disc), aes(fill = class), shape = 21, size = 2.4,
+               colour = INK, stroke = 0.5) +
+    geom_text_repel(data = filter(rb, disc), aes(label = code), size = TXT, colour = INK,
+                    family = FONT, fontface = "bold", box.padding = 0.7, point.padding = 0.3,
+                    force = 8, force_pull = 0.5, max.time = 3, max.iter = 1e5, segment.size = 0.25, segment.colour = INK2, min.segment.length = 0,
+                    max.overlaps = Inf, seed = 11, xlim = c(-L + 0.02, L - 0.02), ylim = c(-L + 0.02, L - 0.14)) +
+    scale_fill_manual(values = CLASS_COL, guide = "none") +
+    scale_x_continuous(breaks = c(-0.5, 0, 0.5), labels = c("−0.5", "0", "0.5")) +
+    scale_y_continuous(breaks = c(-0.5, 0, 0.5), labels = c("−0.5", "0", "0.5")) +
+    coord_equal(xlim = c(-L, L), ylim = c(-L, L), expand = FALSE) +
+    facet_wrap(~ trait, nrow = 1) +
+    labs(x = "Liver, standardized mean difference (grade ≥1 vs 0)",
+         y = "Serum, standardized mean difference") +
+    theme_nat() + theme(panel.spacing = unit(8, "mm"))
+## =====================================================================
+## c. butterfly chart: histology-associated features, liver vs serum
+## =====================================================================
+cnt <- counts
+mods <- c(base = "Base (age, sex, BMI)", TG_adjusted = "+ Hepatic TG index",
+          dilution_adj = "+ Dilution factor", PQN_normalised = "PQN",
+          confounders = "+ HbA1c, glucose", TG_plus_confounders = "+ TG index, HbA1c, glucose",
+          `base+steatosis` = "+ Steatosis")
+slog <- function(x) sign(x) * log10(abs(x) + 1)
+rc <- cnt %>% filter(model %in% names(mods)) %>%
+    transmute(trait = factor(trait, c("steatosis", "inflammation"), c("Steatosis", "Lobular inflammation")),
+              model = factor(mods[model], levels = rev(unname(mods))),
+              Liver = hepatic_sig, Serum = -serum_sig) %>%
+    pivot_longer(c(Liver, Serum), names_to = "compartment", values_to = "n") %>%
+    mutate(x = slog(n), lab = abs(n),
+           hj = case_when(compartment == "Serum" ~ 1, TRUE ~ 0),
+           xl = case_when(compartment == "Serum" ~ x - 0.06, TRUE ~ x + 0.06))
+brk <- c(-100, -10, -1, 0, 1, 10, 100)
+XL <- slog(c(-60, 800))
+pc <- ggplot(rc, aes(x, model, fill = compartment)) +
+    geom_col(width = 0.68) +
+    geom_vline(xintercept = 0, colour = INK, linewidth = 0.35) +
+    geom_text(aes(x = xl, label = lab, hjust = hj), size = TXT, colour = INK2, family = FONT) +
+    geom_text(data = data.frame(trait = factor("Steatosis", levels = levels(rc$trait)),
+                                x = c(-0.05, 0.05), lab = c("Serum", "Liver"), hj = c(1, 0),
+                                compartment = c("Serum", "Liver")),
+              aes(x = x, y = Inf, label = lab, hjust = hj, colour = compartment), inherit.aes = FALSE,
+              vjust = -0.7, size = TXT + 0.3, fontface = "bold", family = FONT) +
+    scale_colour_manual(values = c(Liver = LIVER, Serum = SERUM), guide = "none") +
+    facet_grid(trait ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    scale_fill_manual(values = c(Liver = LIVER, Serum = SERUM), guide = "none") +
+    scale_x_continuous(breaks = slog(brk), labels = abs(brk), limits = XL, expand = expansion(mult = 0)) +
+    coord_cartesian(clip = "off") +
+    labs(x = "Features associated with histology (FDR ≤ 0.10, log scale)", y = NULL) +
+    theme_nat() + theme(strip.placement = "outside",
+                        strip.text.y.left = element_text(angle = 90, hjust = 0.5, face = "bold",
+                                                         margin = margin(0, 2, 0, 0)),
+                        axis.line.y = element_blank(), axis.ticks.y = element_blank(),
+                        axis.text.y = element_text(colour = INK),
+                        panel.grid.major.x = element_line(colour = GRID, linewidth = 0.25),
+                        panel.spacing.y = unit(3, "mm"),
+                        plot.margin = margin(12, 6, 4, 4))
+## =====================================================================
+## d. cross-validated discrimination (one facet per outcome)
+## =====================================================================
+sets <- c(clinical = "Clinical", clinical_plus_serum = "Clinical + serum", clinical_plus_liver = "Clinical + liver")
+outs <- c(steatosis = "Steatosis", inflammation = "Lobular inflammation", MASH = "MASH", fibrosis = "Fibrosis (F1–F4)")
+strip_lab <- cmp_tab %>% filter(comparison == "clinical_plus_serum vs clinical", outcome %in% names(outs)) %>%
+    transmute(outcome, strip = sprintf("**%s**<br>ΔAUC serum %s, *P* %s", outs[outcome],
+                                       fmt_d(mean_AUC_difference),
+                                       fmt_p(DeLong_p_on_averaged_OOF)))
+rd <- auc_tab %>% filter(predictors %in% names(sets), outcome %in% names(outs)) %>%
+    left_join(strip_lab, by = "outcome") %>%
+    mutate(set = factor(sets[predictors], levels = rev(unname(sets))),
+           strip = factor(strip, levels = strip_lab$strip[match(names(outs), strip_lab$outcome)]))
+pd <- ggplot(rd, aes(AUC_mean, set, colour = set)) +
+    geom_vline(xintercept = 0.5, colour = MUTED, linewidth = 0.3, linetype = "22") +
+    geom_segment(aes(x = 0.5, xend = AUC_mean, yend = set), linewidth = 0.35, alpha = 0.3) +
+    geom_linerange(aes(xmin = AUC_min_rep, xmax = AUC_max_rep), linewidth = 1.4, alpha = 0.3) +
+    geom_point(size = 2.2) +
+      geom_text(aes(x = pmax(AUC_mean, AUC_max_rep, na.rm = TRUE), label = sprintf("%.2f", AUC_mean)),
+              hjust = -0.3, size = TXT, colour = INK, family = FONT, show.legend = FALSE) +
+    facet_wrap(~ strip, nrow = 1) +
+    scale_colour_manual(values = c(Clinical = CLIN, `Clinical + serum` = SERUM, `Clinical + liver` = LIVER),
+                        guide = "none") +
+    scale_x_continuous(limits = c(0.5, 1.02), breaks = c(0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+                       labels = c("0.5", "", "0.7", "", "0.9", ""), expand = expansion(mult = c(0, 0))) +
+    scale_y_discrete(expand = expansion(add = 0.6)) +
+    labs(x = "Cross-validated AUC (point, mean; bar, range over 10 repeats)", y = NULL) +
+    theme_nat() + theme(axis.text.y = element_text(colour = INK, size = 6.5),
+                        axis.ticks.y = element_blank(), axis.line.y = element_blank(),
+                        strip.text = ggtext::element_markdown(size = 6.5, lineheight = 1.15,
+                                                              hjust = 0, margin = margin(0, 0, 3, 0)),
+                        panel.grid.major.x = element_line(colour = GRID, linewidth = 0.25),
+                        panel.spacing.x = unit(5, "mm"))
+## =====================================================================
+## assemble and save
+## =====================================================================
+design <- "
+AB
+AC
+DD
+"
+tag_th <- theme(plot.tag = element_text(face = "bold", size = 10, family = FONT),
+                plot.tag.position = c(0, 1))
+pa <- pa + labs(tag = "a") + tag_th
+pc <- pc + labs(tag = "c") + tag_th
+pd <- pd + labs(tag = "d") + tag_th
+## panel b: "b" drawn as the plot title (free() keeps titles)
+pb <- pb + labs(tag = NULL, title = "b") +
+  theme(plot.title = element_text(face = "bold", size = 10, family = FONT, hjust = 0,
+                                  margin = margin(0, 0, 2, 0)),
+        plot.title.position = "plot")
+fig <- pa + free(pb) + pc + pd +
+    plot_layout(design = design, widths = c(0.36, 0.64), heights = c(0.40, 0.38, 0.22))
+## ---- check panel d against Table S11d–e before saving -----------------
+print(strip_lab$strip)
+print(rd[, c("outcome", "predictors", "AUC_mean")], row.names = FALSE)
+dev_pdf <- if (capabilities("cairo")) cairo_pdf else "pdf"
+ggsave(file.path(OUT, "Fig4.pdf"), fig, width = FIG_W, height = FIG_H, units = "mm", device = dev_pdf)
+ggsave(file.path(OUT, "Fig4.png"), fig, width = FIG_W, height = FIG_H, units = "mm", dpi = 600, bg = "white")
+cat("\nDone. Tables, CSVs and Fig4.pdf/png are in", normalizePath(OUT), "\n")
+```
+
+## Source Data Fig. 4
+
+```{r pairedli-02, message=FALSE, warning=FALSE}
+write_source_data("Source Data Fig. 4.xlsx", list(
+  sd_panel("Fig. 4a", "Liver-serum Spearman correlations of the 40 matched metabolites (n = 187) with Fisher 95% CI.", ra),
+  sd_panel("Fig. 4b", "Standardized association with steatosis or lobular inflammation in liver and serum (limma adjusted for age, sex and BMI).", rb),
+  sd_panel("Fig. 4c", "Number of histology-associated features (FDR <= 0.10) in liver and serum under each model.", rc),
+  sd_panel("Fig. 4d", "Cross-validated AUC (elastic net, 10 x 5-fold): mean and range over repeats.", rd)))
+```
+
+## Keep output folder of the paired analysis
+
+```{r pairedli-03, message=FALSE, warning=FALSE}
+FIG4_OUT <- OUT
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Fig4_paired_liver_serum")   # lets the next step start from here
+```
