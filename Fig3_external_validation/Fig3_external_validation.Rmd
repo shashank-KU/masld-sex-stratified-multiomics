@@ -1,0 +1,5349 @@
+---
+title: "Fig. 3: external validation (Tables S5-S9)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Fig3_external_validation.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig2_serum_metabolome`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig2_serum_metabolome")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Fig3_external_validation")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# External validation: Fig. 3 and Tables S5-S9
+
+Discovery signatures in independent cohorts. Liver transcriptome: GSE162694 and GSE135251 (primary, and sensitivity analysis adjusted for sex inferred from expression); replication requires FDR <= 0.05 in both cohorts. Liver lipidome: ST000915.
+
+## Discovery results under the names used by the validation chunks
+
+```{r external-01, message=FALSE, warning=FALSE}
+# The validation chunks below compare each external cohort with the discovery DESeq2 results
+# (same model as Table S1: ~ age + BMI + sex + trait, genes with >= 10 reads in >= 10 samples)
+resLFC_steatosis    <- as.data.frame(disc_res$Steatosis)
+resLFC_inflammation <- as.data.frame(disc_res$Inflammation)
+resLFC_fibrosis     <- as.data.frame(disc_res$Fibrosis)
+```
+
+#### GSE162694
+
+```{r external-02}
+# ============================================================
+# FULL PIPELINE: GSE162694 EXTERNAL VALIDATION
+# DESeq2 DEGs -> FDR ≤ 0.05 (both discovery & validation)
+# KEGG enrichment -> FDR ≤ 0.10
+# Panel D: KEGG Count >= 3, faceted by KEGG Category,
+#          colored by Direction (Up = #ffa500ff, Down = #4575B4)
+# ============================================================
+# ------------------------------------------------------------
+# 0. PACKAGES
+# ------------------------------------------------------------
+required_packages <- c(
+  "GEOquery","DESeq2","dplyr","stringr","ggplot2",
+  "clusterProfiler","org.Hs.eg.db","AnnotationDbi","enrichplot",
+  "ggrepel","tidyr","patchwork","ggvenn","scales","viridis","cowplot",
+  "KEGGREST"
+)
+for (p in required_packages) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(GEOquery)
+library(ggrepel)
+library(tidyr)
+library(ggvenn)
+library(scales)
+library(viridis)
+library(KEGGREST)
+# ============================================================
+# GLOBAL THRESHOLDS
+# ============================================================
+FDR_DESEQ  <- 0.05   # DESeq2 DEG significance (discovery AND validation)
+FDR_KEGG   <- 0.10   # KEGG enrichment significance
+MIN_COUNT  <- 3       # Minimum gene count per KEGG term for plotting
+# ------------------------------------------------------------
+# 1. PHENOTYPE DATA
+# ------------------------------------------------------------
+gse162694   <- getGEO("GSE162694", GSEMatrix = TRUE)
+eset_162694 <- gse162694[[1]]
+pheno_raw   <- pData(eset_162694)
+get_col <- function(df, pattern) {
+  idx <- grep(pattern, colnames(df), ignore.case = TRUE)
+  if (length(idx) == 0) {
+    stop("No column found matching pattern: ", pattern)
+  }
+  if (length(idx) > 1) idx <- idx[1]
+  df[[idx]]
+}
+pheno <- data.frame(
+  GSM   = pheno_raw$geo_accession,
+  Title = pheno_raw$title,
+  Sex_raw       = tryCatch(get_col(pheno_raw, "^sex"),     error = function(e) NA),
+  Age_raw       = tryCatch(get_col(pheno_raw, "^age"),     error = function(e) NA),
+  Fibrosis_raw  = tryCatch(get_col(pheno_raw, "fibrosis"), error = function(e) NA),
+  NAS_raw       = tryCatch(get_col(pheno_raw, "nas"),      error = function(e) NA),
+  stringsAsFactors = FALSE
+)
+rownames(pheno) <- pheno$GSM
+pheno$Sex <- dplyr::case_when(
+  grepl("female|^f$", pheno$Sex_raw, ignore.case = TRUE) ~ "Female",
+  grepl("male|^m$",   pheno$Sex_raw, ignore.case = TRUE) ~ "Male",
+  TRUE ~ NA_character_
+)
+pheno$Sex <- factor(pheno$Sex, levels = c("Female","Male"))
+pheno$Age <- as.numeric(str_extract(pheno$Age_raw, "[0-9]+\\.?[0-9]*"))
+pheno$Fibrosis_stage <- str_extract(pheno$Fibrosis_raw, "[0-9]+")
+pheno$Fibrosis_stage[grepl("normal|control|none", pheno$Fibrosis_raw, ignore.case = TRUE)] <- "0"
+pheno$Fibrosis_stage <- as.numeric(pheno$Fibrosis_stage)
+pheno$NAS_score <- as.numeric(str_extract(pheno$NAS_raw, "[0-9]+\\.?[0-9]*"))
+cat("\n===== METADATA CHECK =====\n")
+cat("Samples:", nrow(pheno), "\n")
+print(table(pheno$Sex, useNA = "ifany"))
+print(summary(pheno$Age))
+print(table(pheno$Fibrosis_stage, useNA = "ifany"))
+print(table(pheno$NAS_score, useNA = "ifany"))
+if (all(is.na(pheno$Sex)) || all(is.na(pheno$Age))) {
+  stop("Sex/Age extraction failed — inspect Sex_raw/Age_raw manually.")
+}
+# ------------------------------------------------------------
+# 2. DOWNLOAD RAW COUNTS
+# ------------------------------------------------------------
+supp_dir <- "GSE162694"
+if (!dir.exists(supp_dir) || length(list.files(supp_dir)) == 0) {
+  getGEOSuppFiles("GSE162694", makeDirectory = TRUE, baseDir = ".")
+}
+supp_files <- list.files(supp_dir, full.names = TRUE, recursive = TRUE)
+count_file <- supp_files[grepl("count", supp_files, ignore.case = TRUE)][1]
+if (is.na(count_file)) stop("No count file found. Files present:\n", paste(supp_files, collapse="\n"))
+cat("\nUsing count file:", count_file, "\n")
+count_df <- if (grepl("\\.csv", count_file, ignore.case = TRUE)) {
+  read.csv(count_file, check.names = FALSE, stringsAsFactors = FALSE)
+} else {
+  read.delim(count_file, check.names = FALSE, stringsAsFactors = FALSE)
+}
+gene_ids <- count_df[[1]]
+count_mat_raw <- as.matrix(count_df[, -1, drop = FALSE])
+storage.mode(count_mat_raw) <- "numeric"
+rownames(count_mat_raw) <- sub("\\..*$", "", gene_ids)
+count_mat_raw <- count_mat_raw[!is.na(rownames(count_mat_raw)) & rownames(count_mat_raw) != "", , drop = FALSE]
+# ------------------------------------------------------------
+# 3. MATCH SAMPLES
+# ------------------------------------------------------------
+count_sample_key <- str_extract(colnames(count_mat_raw), "548nash[0-9]+")
+pheno$SampleKey   <- str_extract(pheno$Title, "548nash[0-9]+")
+common_keys <- intersect(count_sample_key, pheno$SampleKey)
+common_keys <- common_keys[!is.na(common_keys)]
+if (length(common_keys) == 0) stop("No samples matched between counts and phenotype.")
+count_idx <- match(common_keys, count_sample_key)
+pheno_idx <- match(common_keys, pheno$SampleKey)
+counts_all <- count_mat_raw[, count_idx, drop = FALSE]
+pheno_all  <- pheno[pheno_idx, , drop = FALSE]
+colnames(counts_all) <- pheno_all$GSM
+rownames(pheno_all)  <- pheno_all$GSM
+stopifnot(identical(colnames(counts_all), rownames(pheno_all)))
+cat("Matched:", ncol(counts_all), "samples,", nrow(counts_all), "genes\n")
+# ------------------------------------------------------------
+# 4. DEFINE PHENOTYPE GROUPS
+# ------------------------------------------------------------
+pheno_all$Fibrosis <- factor(
+  ifelse(pheno_all$Fibrosis_stage == 0, "F0", "F1_F4"),
+  levels = c("F0","F1_F4")
+)
+cat("\nFibrosis groups:\n"); print(table(pheno_all$Fibrosis, useNA = "ifany"))
+# ------------------------------------------------------------
+# 5. FIBROSIS DESeq2 (Sex + Age adjusted), FDR = 0.05
+# ------------------------------------------------------------
+fib_ok <- complete.cases(pheno_all$Fibrosis, pheno_all$Sex, pheno_all$Age)
+pheno_fib_de <- pheno_all[fib_ok, , drop = FALSE]
+counts_fib   <- counts_all[, rownames(pheno_fib_de), drop = FALSE]
+pheno_fib_de$Age_z <- as.numeric(scale(pheno_fib_de$Age))
+keep_fib <- rowSums(counts_fib >= 10) >= 10
+counts_fib <- counts_fib[keep_fib, , drop = FALSE]
+cat("\nGenes retained (fibrosis):", nrow(counts_fib), " | Samples:", ncol(counts_fib), "\n")
+dds_fib <- DESeqDataSetFromMatrix(
+  countData = round(counts_fib),
+  colData   = pheno_fib_de,
+  design    = ~ Sex + Age_z + Fibrosis
+)
+dds_fib <- DESeq(dds_fib)
+fibrosis_coef <- grep("^Fibrosis_", resultsNames(dds_fib), value = TRUE)
+res_fib_external    <- results(dds_fib, name = fibrosis_coef, alpha = FDR_DESEQ)
+resLFC_fib_external <- lfcShrink(dds_fib, coef = fibrosis_coef, type = "apeglm")
+res_fib_external    <- res_fib_external[!is.na(res_fib_external$padj), ]
+resLFC_fib_external <- resLFC_fib_external[!is.na(resLFC_fib_external$padj), ]
+fib_ext_up   <- rownames(subset(resLFC_fib_external, padj <= FDR_DESEQ & log2FoldChange > 0))
+fib_ext_down <- rownames(subset(resLFC_fib_external, padj <= FDR_DESEQ & log2FoldChange < 0))
+cat("\n=== GSE162694 FIBROSIS (FDR<", FDR_DESEQ, ") ===\n")
+cat("Total DEGs:", length(c(fib_ext_up, fib_ext_down)),
+   " UP:", length(fib_ext_up), " DOWN:", length(fib_ext_down), "\n")
+# ------------------------------------------------------------
+# 6. NAS DESeq2 (Sex + Age adjusted), FDR = 0.05
+# ------------------------------------------------------------
+nas_ok <- complete.cases(pheno_all$NAS_score, pheno_all$Sex, pheno_all$Age)
+pheno_nas_de <- pheno_all[nas_ok, , drop = FALSE]
+counts_nas   <- counts_all[, rownames(pheno_nas_de), drop = FALSE]
+pheno_nas_de$Age_z <- as.numeric(scale(pheno_nas_de$Age))
+keep_nas <- rowSums(counts_nas >= 10) >= 10
+counts_nas <- counts_nas[keep_nas, , drop = FALSE]
+cat("\nGenes retained (NAS):", nrow(counts_nas), " | Samples:", ncol(counts_nas), "\n")
+dds_nas <- DESeqDataSetFromMatrix(
+  countData = round(counts_nas),
+  colData   = pheno_nas_de,
+  design    = ~ Sex + Age_z + NAS_score
+)
+dds_nas <- DESeq(dds_nas)
+nas_coef <- grep("NAS_score", resultsNames(dds_nas), value = TRUE)
+res_nas_external    <- results(dds_nas, name = nas_coef, alpha = FDR_DESEQ)
+resLFC_nas_external <- lfcShrink(dds_nas, coef = nas_coef, type = "apeglm")
+res_nas_external    <- res_nas_external[!is.na(res_nas_external$padj), ]
+resLFC_nas_external <- resLFC_nas_external[!is.na(resLFC_nas_external$padj), ]
+nas_up   <- rownames(subset(resLFC_nas_external, padj <= FDR_DESEQ & log2FoldChange > 0))
+nas_down <- rownames(subset(resLFC_nas_external, padj <= FDR_DESEQ & log2FoldChange < 0))
+cat("\n=== GSE162694 NAS score (FDR<", FDR_DESEQ, ") ===\n")
+cat("Total:", length(c(nas_up, nas_down)),
+   " UP:", length(nas_up), " DOWN:", length(nas_down), "\n")
+# ------------------------------------------------------------
+# 7. VST for downstream use (PCA)
+# ------------------------------------------------------------
+dds_vst_all <- DESeqDataSetFromMatrix(countData = round(counts_all),
+                                      colData = pheno_all, design = ~1)
+dds_vst_all <- DESeq(dds_vst_all)
+vsd_all     <- vst(dds_vst_all, blind = TRUE)
+exp_val_all <- t(assay(vsd_all))
+# ------------------------------------------------------------
+# 8. DEG COMPARISON FUNCTION (Discovery vs Validation), FDR = 0.05 both sides
+# ------------------------------------------------------------
+validate_signature <- function(discovery, external, label, fdr = FDR_DESEQ) {
+  disc_sig <- rownames(subset(discovery, !is.na(padj) & padj <= fdr))
+  ext_sig  <- rownames(subset(external,  !is.na(padj) & padj <= fdr))
+  overlap  <- intersect(disc_sig, ext_sig)
+  x <- discovery[overlap, "log2FoldChange"]
+  y <- external[overlap, "log2FoldChange"]
+  ok <- complete.cases(x, y)
+  overlap <- overlap[ok]; x <- x[ok]; y <- y[ok]
+  same_direction <- sign(x) == sign(y)
+  cat("\n====================================\n", label, "\n")
+  cat("Discovery significant:", length(disc_sig), "\n")
+  cat("External significant:", length(ext_sig), "\n")
+  cat("Overlap:", length(overlap), "\n")
+  if (length(overlap) > 1) {
+    rho <- cor.test(x, y, method = "spearman")
+    binom <- binom.test(sum(same_direction), length(same_direction),
+                        p = 0.5, alternative = "greater")
+    cat("Spearman rho:", round(unname(rho$estimate), 3), "\n")
+    cat("Spearman P:", format.pval(rho$p.value, digits = 4), "\n")
+    cat("Same direction:", round(100 * mean(same_direction), 2), "%\n")
+    cat("Binomial P:", format.pval(binom$p.value, digits = 4), "\n")
+  }
+  cat("====================================\n")
+  invisible(list(genes = overlap, discovery_lfc = x, external_lfc = y,
+                same_direction = same_direction))
+}
+validation_fibrosis <- validate_signature(
+  resLFC_fibrosis, resLFC_fib_external, "FIBROSIS: Discovery vs GSE162694", fdr = FDR_DESEQ)
+validation_steatosis <- validate_signature(
+  resLFC_steatosis, resLFC_nas_external, "STEATOSIS vs GSE162694 NAS", fdr = FDR_DESEQ)
+validation_inflammation <- validate_signature(
+  resLFC_inflammation, resLFC_nas_external, "INFLAMMATION vs GSE162694 NAS", fdr = FDR_DESEQ)
+# ------------------------------------------------------------
+# 9. KEGG ENRICHMENT FUNCTION, FDR = 0.10
+# ------------------------------------------------------------
+run_kegg_external <- function(res, direction = c("up","down"), fdr_deg = FDR_DESEQ, fdr_kegg = FDR_KEGG) {
+  direction <- match.arg(direction)
+  genes <- if (direction == "up") {
+    rownames(subset(res, !is.na(padj) & padj <= fdr_deg & log2FoldChange > 0))
+  } else {
+    rownames(subset(res, !is.na(padj) & padj <= fdr_deg & log2FoldChange < 0))
+  }
+  background <- rownames(res)
+  genes <- unique(genes[grepl("^ENSG", genes)])
+  background <- unique(background[grepl("^ENSG", background)])
+  if (length(genes) < 5) return(NULL)
+  gene_map <- AnnotationDbi::select(org.Hs.eg.db, keys = genes,
+                                    keytype = "ENSEMBL", columns = "ENTREZID")
+  background_map <- AnnotationDbi::select(org.Hs.eg.db, keys = background,
+                                          keytype = "ENSEMBL", columns = "ENTREZID")
+  gene_map <- gene_map[!is.na(gene_map$ENTREZID), ]
+  background_map <- background_map[!is.na(background_map$ENTREZID), ]
+  ek <- enrichKEGG(gene = unique(gene_map$ENTREZID),
+                   universe = unique(background_map$ENTREZID),
+                   organism = "hsa",
+                   pvalueCutoff = fdr_kegg,
+                   qvalueCutoff = fdr_kegg)
+  ek
+}
+kegg_fib_ext_up   <- run_kegg_external(resLFC_fib_external, "up")
+kegg_fib_ext_down <- run_kegg_external(resLFC_fib_external, "down")
+kegg_nas_ext_up   <- run_kegg_external(resLFC_nas_external, "up")
+kegg_nas_ext_down <- run_kegg_external(resLFC_nas_external, "down")
+# ------------------------------------------------------------
+# NOTE: Ensure discovery-cohort KEGG objects also use FDR = 0.10
+# ekegg_up_fibrosis   <- enrichKEGG(..., pvalueCutoff = 0.10, qvalueCutoff = 0.10)
+# ekegg_down_fibrosis <- enrichKEGG(..., pvalueCutoff = 0.10, qvalueCutoff = 0.10)
+# ekegg_up_steatosis  <- enrichKEGG(..., pvalueCutoff = 0.10, qvalueCutoff = 0.10)
+# ekegg_down_steatosis<- enrichKEGG(..., pvalueCutoff = 0.10, qvalueCutoff = 0.10)
+# ------------------------------------------------------------
+report_pathway_overlap <- function(disc_kegg, ext_kegg, label) {
+  if (is.null(disc_kegg) || is.null(ext_kegg)) return(invisible(NULL))
+  overlap <- intersect(disc_kegg@result$ID, ext_kegg@result$ID)
+  cat("\n====", label, "====\n")
+  cat("Overlapping pathways:", length(overlap), "\n")
+  if (length(overlap) > 0) {
+    print(disc_kegg@result[match(overlap, disc_kegg@result$ID), c("ID","Description")])
+  }
+}
+report_pathway_overlap(ekegg_up_fibrosis,   kegg_fib_ext_up,   "FIBROSIS UP PATHWAY REPLICATION")
+report_pathway_overlap(ekegg_down_fibrosis, kegg_fib_ext_down, "FIBROSIS DOWN PATHWAY REPLICATION")
+report_pathway_overlap(ekegg_up_steatosis,   kegg_nas_ext_up,   "STEATOSIS UP / NAS UP SUPPORT")
+report_pathway_overlap(ekegg_down_steatosis, kegg_nas_ext_down, "STEATOSIS DOWN / NAS DOWN SUPPORT")
+# ------------------------------------------------------------
+# 10. EXACT REPLICATED GENE LISTS
+# ------------------------------------------------------------
+disc_fib_up   <- rownames(subset(resLFC_fibrosis, !is.na(padj) & padj <= FDR_DESEQ & log2FoldChange > 0))
+disc_fib_down <- rownames(subset(resLFC_fibrosis, !is.na(padj) & padj <= FDR_DESEQ & log2FoldChange < 0))
+fib_up_up_genes     <- intersect(disc_fib_up, fib_ext_up)
+fib_down_down_genes <- intersect(disc_fib_down, fib_ext_down)
+cat("\n=== REPLICATED FIBROSIS GENES ===\n")
+cat("UP/UP:", length(fib_up_up_genes), "\n"); print(fib_up_up_genes)
+cat("DOWN/DOWN:", length(fib_down_down_genes), "\n"); print(fib_down_down_genes)
+disc_steat_up   <- rownames(subset(resLFC_steatosis, !is.na(padj) & padj <= FDR_DESEQ & log2FoldChange > 0))
+disc_steat_down <- rownames(subset(resLFC_steatosis, !is.na(padj) & padj <= FDR_DESEQ & log2FoldChange < 0))
+steat_up_nas_up     <- intersect(disc_steat_up, nas_up)
+steat_down_nas_down <- intersect(disc_steat_down, nas_down)
+cat("\n=== STEATOSIS SIGNATURE SUPPORT FROM NAS ===\n")
+cat("UP/UP:", length(steat_up_nas_up), "\n"); print(steat_up_nas_up)
+cat("DOWN/DOWN:", length(steat_down_nas_down), "\n"); print(steat_down_nas_down)
+# ------------------------------------------------------------
+# 11. SAVE RESULTS
+# ------------------------------------------------------------
+write.csv(pheno_all, "GSE162694_metadata_clean.csv", row.names = FALSE)
+write.csv(as.data.frame(resLFC_fib_external), "GSE162694_Fibrosis_SexAge_adjusted.csv")
+write.csv(as.data.frame(resLFC_nas_external), "GSE162694_NAS_SexAge_adjusted.csv")
+saveRDS(resLFC_fib_external, "GSE162694_resLFC_fibrosis.rds")
+saveRDS(resLFC_nas_external, "GSE162694_resLFC_nas.rds")
+# ============================================================
+# ============================================================
+#          PUBLICATION-QUALITY VALIDATION FIGURE
+# ============================================================
+# ============================================================
+theme_pub <- theme_bw(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle    = element_text(size = 11, hjust = 0.5, color = "grey30"),
+    axis.title       = element_text(face = "bold", size = 12),
+    axis.text        = element_text(color = "black", size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "grey92"),
+    legend.title     = element_text(face = "bold", size = 11),
+    legend.text      = element_text(size = 10),
+    strip.background = element_rect(fill = "grey20"),
+    strip.text       = element_text(color = "white", face = "bold")
+  )
+# ------------------------------------------------------------
+# PANEL A — LOG2FC CONCORDANCE SCATTER (Fibrosis), FDR = 0.05 both
+# ------------------------------------------------------------
+common_fib <- intersect(rownames(resLFC_fibrosis), rownames(resLFC_fib_external))
+df_fib <- data.frame(
+  Gene            = common_fib,
+  Discovery_LFC   = resLFC_fibrosis[common_fib, "log2FoldChange"],
+  Validation_LFC  = resLFC_fib_external[common_fib, "log2FoldChange"],
+  Discovery_padj  = resLFC_fibrosis[common_fib, "padj"],
+  Validation_padj = resLFC_fib_external[common_fib, "padj"]
+) %>%
+  filter(complete.cases(.)) %>%
+  mutate(
+    Status = case_when(
+      Discovery_padj <= FDR_DESEQ & Validation_padj <= FDR_DESEQ &
+        sign(Discovery_LFC) == sign(Validation_LFC) ~ "Replicated (concordant)",
+      Discovery_padj <= FDR_DESEQ & Validation_padj <= FDR_DESEQ &
+        sign(Discovery_LFC) != sign(Validation_LFC) ~ "Discordant direction",
+      Discovery_padj <= FDR_DESEQ ~ "Discovery-only",
+      Validation_padj <= FDR_DESEQ ~ "Validation-only",
+      TRUE ~ "Not significant"
+    ),
+    Status = factor(Status, levels = c("Replicated (concordant)","Discordant direction",
+                                       "Discovery-only","Validation-only","Not significant"))
+  )
+rho_fib <- cor.test(df_fib$Discovery_LFC, df_fib$Validation_LFC, method = "spearman")
+same_dir_fib <- mean(sign(df_fib$Discovery_LFC) == sign(df_fib$Validation_LFC)) * 100
+label_genes <- df_fib %>% filter(Status == "Replicated (concordant)") %>%
+  arrange(desc(abs(Discovery_LFC) + abs(Validation_LFC))) %>% head(10)
+label_genes$Symbol <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = label_genes$Gene,
+                                            column = "SYMBOL", keytype = "ENSEMBL",
+                                            multiVals = "first")
+panel_A <- ggplot(df_fib, aes(x = Discovery_LFC, y = Validation_LFC)) +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = 0, ymax = Inf, fill = "#fddbc7", alpha = 0.25) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = -Inf, ymax = 0, fill = "#d1e5f0", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(aes(color = Status, size = Status, alpha = Status)) +
+  geom_smooth(method = "lm", se = TRUE, color = "#b2182b", fill = "#f4a582", linewidth = 1) +
+  ggrepel::geom_text_repel(data = label_genes, aes(label = Symbol),
+                           size = 3.4, fontface = "italic", max.overlaps = 20,
+                           box.padding = 0.5, segment.color = "grey50") +
+  scale_color_manual(values = c(
+    "Replicated (concordant)" = "#b2182b",
+    "Discordant direction"    = "#878787",
+    "Discovery-only"          = "#4393c3",
+    "Validation-only"         = "#f4a582",
+    "Not significant"         = "grey80"
+  )) +
+  scale_size_manual(values = c(3, 2.5, 1.8, 1.8, 0.8)) +
+  scale_alpha_manual(values = c(0.95, 0.8, 0.6, 0.6, 0.25)) +
+  labs(
+    title = "Fibrosis: Discovery vs GSE162694 Replication",
+    subtitle = paste0("Spearman ρ = ", round(rho_fib$estimate, 3),
+                     ", P = ", format.pval(rho_fib$p.value, digits = 3),
+                     "  |  Same direction = ", round(same_dir_fib, 1), "%",
+                     "  |  DESeq2 FDR <= ", FDR_DESEQ),
+    x = "log2FC — Discovery Cohort",
+    y = "log2FC — GSE162694 (Validation)",
+    color = "Gene status"
+  ) +
+  guides(size = "none", alpha = "none") +
+  theme_pub +
+  theme(legend.position = "bottom")
+# ------------------------------------------------------------
+# PANEL B — VENN DIAGRAMS, FDR = 0.05 both cohorts
+# ------------------------------------------------------------
+disc_fib_sig  <- rownames(subset(resLFC_fibrosis, padj <= FDR_DESEQ))
+val_fib_sig   <- rownames(subset(resLFC_fib_external, padj <= FDR_DESEQ))
+disc_steat_sig <- rownames(subset(resLFC_steatosis, padj <= FDR_DESEQ))
+disc_infl_sig  <- rownames(subset(resLFC_inflammation, padj <= FDR_DESEQ))
+val_nas_sig    <- rownames(subset(resLFC_nas_external, padj <= FDR_DESEQ))
+venn_fib_list   <- list("Discovery\nFibrosis" = disc_fib_sig, "GSE162694\nFibrosis" = val_fib_sig)
+venn_steat_list <- list("Discovery\nSteatosis" = disc_steat_sig, "GSE162694\nNAS score" = val_nas_sig)
+venn_infl_list  <- list("Discovery\nInflammation" = disc_infl_sig, "GSE162694\nNAS score" = val_nas_sig)
+make_venn <- function(lst, title, fill_cols) {
+  ggvenn(lst, fill_color = fill_cols, stroke_size = 0.6,
+        set_name_size = 4, text_size = 5, show_percentage = FALSE) +
+    ggtitle(title) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+         panel.background = element_rect(fill = "white", color = NA))
+}
+venn_fib   <- make_venn(venn_fib_list,   "Fibrosis DEG Overlap (FDR ≤ 0.05)",     c("#b2182b","#4393c3"))
+venn_steat <- make_venn(venn_steat_list, "Steatosis vs NAS Overlap (FDR ≤ 0.05)", c("#f4a582","#4393c3"))
+venn_infl  <- make_venn(venn_infl_list,  "Inflammation vs NAS Overlap (FDR ≤ 0.05)", c("#92c5de","#4393c3"))
+panel_B <- plot_grid(venn_fib, venn_steat, venn_infl, ncol = 3)
+# ------------------------------------------------------------
+# PANEL C — DIRECTIONAL REPLICATION SUMMARY, FDR = 0.05 both
+# ------------------------------------------------------------
+get_stats <- function(res_disc, res_val, fdr = FDR_DESEQ) {
+  disc <- subset(res_disc, !is.na(padj) & padj <= fdr)
+  val  <- subset(res_val,  !is.na(padj) & padj <= fdr)
+  overlap <- intersect(rownames(disc), rownames(val))
+  if (length(overlap) < 2) {
+    return(data.frame(rho = NA, p = NA, pct_concordant = NA, n = length(overlap), binom_p = NA))
+  }
+  x <- res_disc[overlap, "log2FoldChange"]
+  y <- res_val[overlap, "log2FoldChange"]
+  rho <- cor.test(x, y, method = "spearman")
+  same <- sign(x) == sign(y)
+  binom <- binom.test(sum(same), length(same), p = 0.5, alternative = "greater")
+  data.frame(rho = unname(rho$estimate), p = rho$p.value,
+            pct_concordant = mean(same) * 100, n = length(overlap),
+            binom_p = binom$p.value)
+}
+stats_fib   <- get_stats(resLFC_fibrosis, resLFC_fib_external)
+stats_steat <- get_stats(resLFC_steatosis, resLFC_nas_external)
+stats_infl  <- get_stats(resLFC_inflammation, resLFC_nas_external)
+summary_df <- bind_rows(
+  cbind(Trait = "Fibrosis vs Fibrosis", stats_fib),
+  cbind(Trait = "Steatosis vs NAS", stats_steat),
+  cbind(Trait = "Inflammation vs NAS", stats_infl)
+) %>%
+  mutate(
+    Trait = factor(Trait, levels = rev(c("Fibrosis vs Fibrosis","Steatosis vs NAS","Inflammation vs NAS"))),
+    Significant = ifelse(!is.na(binom_p) & binom_p < 0.05, "Significant replication", "Not significant"),
+    Label = paste0("n=", n, "  ρ=", round(rho, 2))
+  )
+panel_C <- ggplot(summary_df, aes(x = pct_concordant, y = Trait)) +
+  geom_vline(xintercept = 50, linetype = "dashed", color = "grey40", linewidth = 0.8) +
+  geom_segment(aes(x = 50, xend = pct_concordant, y = Trait, yend = Trait, color = Significant),
+              linewidth = 2.2, alpha = 0.5) +
+  geom_point(aes(size = n, color = Significant)) +
+  geom_text(aes(label = Label), vjust = -1.3, size = 3.6, fontface = "bold") +
+  scale_color_manual(values = c("Significant replication" = "#b2182b",
+                                "Not significant" = "grey60")) +
+  scale_size_continuous(range = c(4, 9), guide = "none") +
+  xlim(30, 100) +
+  labs(
+    title = "Directional Replication Summary",
+    subtitle = paste0("DESeq2 FDR <= ", FDR_DESEQ, " both cohorts | dashed line = chance level"),
+    x = "% Same-Direction Genes (Discovery vs Validation)",
+    y = NULL, color = NULL
+  ) +
+  theme_pub +
+  theme(legend.position = "bottom",
+        axis.text.y = element_text(face = "bold", size = 12))
+# ============================================================
+# PANEL D — KEGG PATHWAY REPLICATION
+# Count >= 3 filter, faceted by KEGG Category,
+# colored by Direction: Up = "#ffa500ff", Down = "#4575B4"
+# ============================================================
+# ------------------------------------------------------------
+# D1. Build combined discovery + validation KEGG table
+#     for shared (replicated) pathways only
+# ------------------------------------------------------------
+build_kegg_compare_df <- function(disc_kegg, ext_kegg, direction_label) {
+  if (is.null(disc_kegg) || is.null(ext_kegg)) return(NULL)
+  if (nrow(disc_kegg@result) == 0 || nrow(ext_kegg@result) == 0) return(NULL)
+  shared <- intersect(disc_kegg@result$ID, ext_kegg@result$ID)
+  if (length(shared) == 0) return(NULL)
+  d <- disc_kegg@result %>% filter(ID %in% shared) %>%
+    transmute(ID, Description, Cohort = "Discovery", p.adjust, Count)
+  v <- ext_kegg@result %>% filter(ID %in% shared) %>%
+    transmute(ID, Description, Cohort = "GSE162694", p.adjust, Count)
+  bind_rows(d, v) %>% mutate(Direction = direction_label)
+}
+kegg_compare_up   <- build_kegg_compare_df(ekegg_up_fibrosis,   kegg_fib_ext_up,   "Up")
+kegg_compare_down <- build_kegg_compare_df(ekegg_down_fibrosis, kegg_fib_ext_down, "Down")
+kegg_compare_all  <- bind_rows(kegg_compare_up, kegg_compare_down)
+# ------------------------------------------------------------
+# D2. Filter Count >= MIN_COUNT (both cohort rows for a term must qualify)
+# ------------------------------------------------------------
+if (!is.null(kegg_compare_all) && nrow(kegg_compare_all) > 0) {
+  kegg_compare_all <- kegg_compare_all %>%
+    group_by(ID) %>%
+    filter(all(Count >= MIN_COUNT)) %>%
+    ungroup()
+}
+# ------------------------------------------------------------
+# D3. Fetch KEGG Category (Main_Category) via KEGGREST
+#     - same approach as your previous kegg_top pipeline
+# ------------------------------------------------------------
+get_kegg_category <- function(pathway_id) {
+  info <- tryCatch(keggGet(pathway_id)[[1]], error = function(e) NULL)
+  if (!is.null(info$CLASS)) {
+    return(info$CLASS[1])
+  } else {
+    return(NA)
+  }
+}
+if (!is.null(kegg_compare_all) && nrow(kegg_compare_all) > 0) {
+  unique_ids <- unique(kegg_compare_all$ID)
+  categories <- sapply(unique_ids, get_kegg_category)
+  category_df <- data.frame(
+    ID = unique_ids,
+    Category = categories,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      Main_Category = sapply(strsplit(Category, ";"), `[`, 1),
+      Sub_Category  = sapply(strsplit(Category, ";"), `[`, 2)
+    )
+  # Manual override example (as in the original code)
+  category_df$Main_Category[category_df$ID == "hsa04820"] <- "Cellular Processes"
+  kegg_compare_all <- kegg_compare_all %>%
+    left_join(category_df[, c("ID","Main_Category")], by = "ID") %>%
+    mutate(Main_Category = ifelse(is.na(Main_Category), "Unclassified", Main_Category))
+}
+# ------------------------------------------------------------
+# D4. Build final Panel D plot
+# ------------------------------------------------------------
+if (!is.null(kegg_compare_all) && nrow(kegg_compare_all) > 0) {
+  kegg_compare_all <- kegg_compare_all %>%
+    mutate(
+      neglog10p = -log10(p.adjust),
+      Description = factor(Description, levels = rev(unique(Description))),
+      Direction = factor(Direction, levels = c("Up","Down"))
+    )
+  panel_D <- ggplot(kegg_compare_all, aes(x = Cohort, y = Description,
+                                          size = neglog10p, color = Direction)) +
+    geom_point(alpha = 0.85) +
+    facet_grid(Main_Category ~ ., scales = "free_y", space = "free_y") +
+    scale_color_manual(values = c("Up" = "#ffa500ff", "Down" = "#4575B4")) +
+    scale_size_continuous(range = c(3, 9), name = "-log10(FDR)") +
+    labs(
+      title = "Replicated KEGG Pathways (Fibrosis)",
+      subtitle = paste0("Pathways significant in BOTH cohorts, KEGG FDR <= ", FDR_KEGG,
+                        ", Count \u2265 ", MIN_COUNT),
+      x = NULL, y = NULL, color = "Direction"
+    ) +
+    theme_pub +
+    theme(
+      axis.text.y = element_text(size = 10),
+      strip.text.y = element_text(angle = 0, size = 11, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+} else {
+  panel_D <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+            label = paste0("No overlapping KEGG pathways\n(Count \u2265 ", MIN_COUNT,
+                          ") between cohorts at current thresholds"),
+            size = 5, fontface = "italic") +
+    theme_void() +
+    ggtitle("Replicated KEGG Pathways (Fibrosis)") +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 14))
+}
+# ------------------------------------------------------------
+# COMBINE FINAL FIGURE
+# ------------------------------------------------------------
+bottom_row <- plot_grid(panel_C, panel_D, ncol = 2, rel_widths = c(1, 1.3),
+                        labels = c("C","D"), label_size = 18)
+final_validation_figure <- plot_grid(
+  panel_A,
+  panel_B,
+  bottom_row,
+  ncol = 1,
+  rel_heights = c(1.3, 0.9, 1.1),
+  labels = c("A","B",""),
+  label_size = 18
+)
+final_validation_figure
+ggsave("Figure_Validation_GSE162694.png", final_validation_figure,
+      width = 16, height = 15, dpi = 400, bg = "white")
+ggsave("Figure_Validation_GSE162694.pdf", final_validation_figure,
+      width = 16, height = 15, bg = "white")
+# ---- after running the GSE162694 chunk ----
+val_GSE162694 <- list(
+  label         = "GSE162694",
+  fib_res       = as.data.frame(resLFC_fib_external),   # ENSG rownames
+  nas_res       = as.data.frame(resLFC_nas_external),
+  kegg_fib_up   = kegg_fib_ext_up,
+  kegg_fib_down = kegg_fib_ext_down,
+  kegg_nas_up   = kegg_nas_ext_up,
+  kegg_nas_down = kegg_nas_ext_down
+)
+```
+
+#### GSE135251
+
+```{r external-03}
+# ============================================================
+# GSE135251 EXTERNAL VALIDATION
+# Internal definition:
+# Steatosis     = 0 vs 1+2+3+4
+# Inflammation  = 0 vs 1+2+3+4
+# Fibrosis      = 0 vs 1+2+3+4
+#
+# External:
+# Fibrosis      = F0 vs F1-F4
+# Steatosis     = supporting validation using NAS
+# Inflammation  = supporting validation using NAS
+# No age/sex/BMI adjustment
+# Gene FDR ≤ 0.05
+# KEGG qvalue <= 0.10
+# ============================================================
+library(apeglm)
+FDR_DEG <- 0.05
+FDR_PATH <- 0.10
+# ============================================================
+# 1. GEO PHENOTYPE
+# ============================================================
+gse <- getGEO("GSE135251",GSEMatrix=TRUE)[[1]]
+pheno <- pData(gse)
+pheno$Fibrosis_stage <- as.numeric(
+  pheno$`fibrosis stage:ch1`
+)
+pheno$NAS_score <- as.numeric(
+  pheno$`nas score:ch1`
+)
+cat("\nFIBROSIS STAGE\n")
+print(table(pheno$Fibrosis_stage,useNA="ifany"))
+cat("\nNAS SCORE\n")
+print(table(pheno$NAS_score,useNA="ifany"))
+# ============================================================
+# 2. COUNTS
+# ============================================================
+count_file <- file.path(project_dir, "Analyisis/GSE135251_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+counts_df <- read.delim(
+  gzfile(count_file),
+  header=TRUE,
+  check.names=FALSE,
+  stringsAsFactors=FALSE
+)
+gene_ids <- sub("\\..*$","",counts_df[[1]])
+counts <- as.matrix(
+  counts_df[,-1,drop=FALSE]
+)
+storage.mode(counts) <- "numeric"
+rownames(counts) <- gene_ids
+# ============================================================
+# 3. MATCH COUNTS TO GEO
+# ============================================================
+common <- intersect(
+  colnames(counts),
+  rownames(pheno)
+)
+if(length(common)>0){
+  counts <- counts[,common,drop=FALSE]
+  pheno <- pheno[common,,drop=FALSE]
+} else {
+  count_key <- gsub("\\s+","",colnames(counts))
+  title_key <- gsub("\\s+","",pheno$title)
+  idx <- match(count_key,title_key)
+  keep <- !is.na(idx)
+  counts <- counts[,keep,drop=FALSE]
+  pheno <- pheno[idx[keep],,drop=FALSE]
+  colnames(counts) <- rownames(pheno)
+}
+stopifnot(
+  identical(colnames(counts),rownames(pheno))
+)
+cat("\nMatched samples:",ncol(counts),"\n")
+# ============================================================
+# 4. FIBROSIS: F0 vs F1-F4
+# ============================================================
+pheno$Fibrosis <- factor(
+  ifelse(
+    pheno$Fibrosis_stage==0,
+    "F0",
+    ifelse(
+      pheno$Fibrosis_stage %in% 1:4,
+      "F1_F4",
+      NA
+    )
+  ),
+  levels=c("F0","F1_F4")
+)
+cat("\nFIBROSIS GROUPS\n")
+print(table(pheno$Fibrosis,useNA="ifany"))
+keep <- !is.na(pheno$Fibrosis)
+pheno_fib <- pheno[keep,,drop=FALSE]
+counts_fib <- counts[,rownames(pheno_fib),drop=FALSE]
+keep_gene <- rowSums(counts_fib>=10)>=10
+counts_fib <- counts_fib[keep_gene,,drop=FALSE]
+dds_fib <- DESeqDataSetFromMatrix(
+  countData=round(counts_fib),
+  colData=pheno_fib,
+  design=~Fibrosis
+)
+dds_fib <- DESeq(dds_fib)
+fib_coef <- grep(
+  "^Fibrosis_",
+  resultsNames(dds_fib),
+  value=TRUE
+)
+res_fib_ext <- results(
+  dds_fib,
+  name=fib_coef,
+  alpha=FDR_DEG
+)
+res_fib_ext <- res_fib_ext[
+  !is.na(res_fib_ext$padj),
+  ,
+  drop=FALSE
+]
+resLFC_fib_ext <- lfcShrink(
+  dds_fib,
+  coef=fib_coef,
+  type="apeglm"
+)
+resLFC_fib_ext <- resLFC_fib_ext[
+  !is.na(resLFC_fib_ext$padj),
+  ,
+  drop=FALSE
+]
+# ============================================================
+# 5. FIBROSIS DEGs
+# ============================================================
+ext_fib_up <- rownames(
+  subset(
+    resLFC_fib_ext,
+    padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_fib_down <- rownames(
+  subset(
+    resLFC_fib_ext,
+    padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+cat(
+  "\nGSE135251 FIBROSIS DEGs\n",
+  "Total:",length(c(ext_fib_up,ext_fib_down)),"\n",
+  "UP:",length(ext_fib_up),"\n",
+  "DOWN:",length(ext_fib_down),"\n"
+)
+# ============================================================
+# 6. ENTRES -> ENSEMBL
+# ============================================================
+convert_entrez_to_ensembl <- function(res){
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys=rownames(res),
+    keytype="ENTREZID",
+    columns=c("ENSEMBL","SYMBOL")
+  )
+  map <- map[
+    !is.na(map$ENSEMBL) &
+      !duplicated(map$ENTREZID),
+    ,
+    drop=FALSE
+  ]
+  x <- as.data.frame(res)
+  x$ENTREZID <- rownames(x)
+  x$ENSEMBL <- map$ENSEMBL[
+    match(
+      x$ENTREZID,
+      map$ENTREZID
+    )
+  ]
+  x <- x[
+    !is.na(x$ENSEMBL),
+    ,
+    drop=FALSE
+  ]
+  x <- x[
+    !duplicated(x$ENSEMBL),
+    ,
+    drop=FALSE
+  ]
+  rownames(x) <- x$ENSEMBL
+  x
+}
+res_fib_ext_ens <- convert_entrez_to_ensembl(
+  resLFC_fib_ext
+)
+cat(
+  "External fibrosis genes after Ensembl conversion:",
+  nrow(res_fib_ext_ens),"\n"
+)
+# ============================================================
+# 7. INTERNAL vs EXTERNAL FIBROSIS
+# ============================================================
+int_fib_up <- rownames(
+  subset(
+    resLFC_fibrosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_fib_down <- rownames(
+  subset(
+    resLFC_fibrosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+ext_fib_up <- rownames(
+  subset(
+    res_fib_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_fib_down <- rownames(
+  subset(
+    res_fib_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+fib_up_rep <- intersect(
+  int_fib_up,
+  ext_fib_up
+)
+fib_down_rep <- intersect(
+  int_fib_down,
+  ext_fib_down
+)
+cat(
+  "\nFIBROSIS VALIDATION\n",
+  "Internal UP:",length(int_fib_up),"\n",
+  "Internal DOWN:",length(int_fib_down),"\n",
+  "External UP:",length(ext_fib_up),"\n",
+  "External DOWN:",length(ext_fib_down),"\n",
+  "UP/UP:",length(fib_up_rep),"\n",
+  "DOWN/DOWN:",length(fib_down_rep),"\n"
+)
+# ============================================================
+# 8. FIBROSIS EFFECT-SIZE CONCORDANCE
+# ============================================================
+fib_overlap <- intersect(
+  rownames(
+    subset(
+      resLFC_fibrosis,
+      !is.na(padj) &
+        padj<=FDR_DEG
+    )
+  ),
+  rownames(
+    subset(
+      res_fib_ext_ens,
+      !is.na(padj) &
+        padj<=FDR_DEG
+    )
+  )
+)
+fib_x <- resLFC_fibrosis[
+  fib_overlap,
+  "log2FoldChange"
+]
+fib_y <- res_fib_ext_ens[
+  fib_overlap,
+  "log2FoldChange"
+]
+ok <- complete.cases(fib_x,fib_y)
+fib_x <- fib_x[ok]
+fib_y <- fib_y[ok]
+same_fib <- sign(fib_x)==sign(fib_y)
+if(length(fib_x)>1){
+  fib_cor <- cor.test(
+    fib_x,
+    fib_y,
+    method="spearman"
+  )
+  fib_binom <- binom.test(
+    sum(same_fib),
+    length(same_fib),
+    p=0.5,
+    alternative="greater"
+  )
+  cat(
+    "\nFIBROSIS EFFECT CONCORDANCE\n",
+    "Overlap:",length(fib_x),"\n",
+    "Spearman rho:",
+    round(unname(fib_cor$estimate),3),"\n",
+    "Spearman P:",
+    format.pval(fib_cor$p.value,digits=4),"\n",
+    "Same direction:",
+    round(100*mean(same_fib),2),"%\n",
+    "Binomial P:",
+    format.pval(fib_binom$p.value,digits=4),"\n"
+  )
+}
+# ============================================================
+# 9. NAS ANALYSIS
+# SUPPORTING VALIDATION FOR STEATOSIS + INFLAMMATION
+# ============================================================
+pheno_nas <- pheno[
+  !is.na(pheno$NAS_score),
+  ,
+  drop=FALSE
+]
+counts_nas <- counts[
+  ,
+  rownames(pheno_nas),
+  drop=FALSE
+]
+keep_gene <- rowSums(counts_nas>=10)>=10
+counts_nas <- counts_nas[
+  keep_gene,
+  ,
+  drop=FALSE
+]
+dds_nas <- DESeqDataSetFromMatrix(
+  countData=round(counts_nas),
+  colData=pheno_nas,
+  design=~NAS_score
+)
+dds_nas <- DESeq(dds_nas)
+nas_coef <- grep(
+  "NAS_score",
+  resultsNames(dds_nas),
+  value=TRUE
+)
+res_nas_ext <- results(
+  dds_nas,
+  name=nas_coef,
+  alpha=FDR_DEG
+)
+res_nas_ext <- res_nas_ext[
+  !is.na(res_nas_ext$padj),
+  ,
+  drop=FALSE
+]
+resLFC_nas_ext <- lfcShrink(
+  dds_nas,
+  coef=nas_coef,
+  type="apeglm"
+)
+resLFC_nas_ext <- resLFC_nas_ext[
+  !is.na(resLFC_nas_ext$padj),
+  ,
+  drop=FALSE
+]
+cat(
+  "\nNAS-associated genes:",
+  nrow(resLFC_nas_ext),"\n"
+)
+# ============================================================
+# 10. NAS ENTRES -> ENSEMBL
+# ============================================================
+res_nas_ext_ens <- convert_entrez_to_ensembl(
+  resLFC_nas_ext
+)
+cat(
+  "External NAS genes after Ensembl conversion:",
+  nrow(res_nas_ext_ens),"\n"
+)
+# ============================================================
+# 11. INTERNAL STEATOSIS -> EXTERNAL NAS
+# SUPPORTING VALIDATION ONLY
+# ============================================================
+int_steat_up <- rownames(
+  subset(
+    resLFC_steatosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_steat_down <- rownames(
+  subset(
+    resLFC_steatosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+ext_nas_up <- rownames(
+  subset(
+    res_nas_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_nas_down <- rownames(
+  subset(
+    res_nas_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+steat_up_rep <- intersect(
+  int_steat_up,
+  ext_nas_up
+)
+steat_down_rep <- intersect(
+  int_steat_down,
+  ext_nas_down
+)
+cat(
+  "\nSTEATOSIS -> NAS SUPPORT\n",
+  "Internal UP:",length(int_steat_up),"\n",
+  "Internal DOWN:",length(int_steat_down),"\n",
+  "External NAS UP:",length(ext_nas_up),"\n",
+  "External NAS DOWN:",length(ext_nas_down),"\n",
+  "UP/UP:",length(steat_up_rep),"\n",
+  "DOWN/DOWN:",length(steat_down_rep),"\n"
+)
+# ============================================================
+# 12. INTERNAL INFLAMMATION -> EXTERNAL NAS
+# SUPPORTING VALIDATION ONLY
+# ============================================================
+int_inf_up <- rownames(
+  subset(
+    resLFC_inflammation,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_inf_down <- rownames(
+  subset(
+    resLFC_inflammation,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+inf_up_rep <- intersect(
+  int_inf_up,
+  ext_nas_up
+)
+inf_down_rep <- intersect(
+  int_inf_down,
+  ext_nas_down
+)
+cat(
+  "\nINFLAMMATION -> NAS SUPPORT\n",
+  "Internal UP:",length(int_inf_up),"\n",
+  "Internal DOWN:",length(int_inf_down),"\n",
+  "External NAS UP:",length(ext_nas_up),"\n",
+  "External NAS DOWN:",length(ext_nas_down),"\n",
+  "UP/UP:",length(inf_up_rep),"\n",
+  "DOWN/DOWN:",length(inf_down_rep),"\n"
+)
+# ============================================================
+# 13. KEGG
+# ============================================================
+run_kegg <- function(res,direction){
+  genes <- if(direction=="up"){
+    rownames(
+      subset(
+        res,
+        !is.na(padj) &
+          padj<=FDR_DEG &
+          log2FoldChange>0
+      )
+    )
+  } else {
+    rownames(
+      subset(
+        res,
+        !is.na(padj) &
+          padj<=FDR_DEG &
+          log2FoldChange<0
+      )
+    )
+  }
+  genes <- sub("\\..*$","",genes)
+  genes <- unique(
+    genes[grepl("^ENSG",genes)]
+  )
+  if(length(genes)<5)
+    return(NULL)
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys=genes,
+    keytype="ENSEMBL",
+    columns="ENTREZID"
+  )
+  entrez <- unique(
+    map$ENTREZID[
+      !is.na(map$ENTREZID)
+    ]
+  )
+  if(length(entrez)<5)
+    return(NULL)
+  ek <- enrichKEGG(
+    gene=entrez,
+    organism="hsa",
+    pvalueCutoff=FDR_PATH
+  )
+  if(is.null(ek))
+    return(NULL)
+  ek@result <- subset(
+    ek@result,
+    qvalue<=FDR_PATH
+  )
+  ek
+}
+# ============================================================
+# 14. EXTERNAL KEGG
+# ============================================================
+ext_kegg_fib_up <- run_kegg(
+  res_fib_ext_ens,"up"
+)
+ext_kegg_fib_down <- run_kegg(
+  res_fib_ext_ens,"down"
+)
+ext_kegg_nas_up <- run_kegg(
+  res_nas_ext_ens,"up"
+)
+ext_kegg_nas_down <- run_kegg(
+  res_nas_ext_ens,"down"
+)
+# ============================================================
+# 15. FIBROSIS PATHWAY REPLICATION
+# ============================================================
+if(
+  exists("ekegg_up_fibrosis") &&
+  !is.null(ekegg_up_fibrosis) &&
+  !is.null(ext_kegg_fib_up)
+){
+  fib_up_pathways <- intersect(
+    ekegg_up_fibrosis@result$ID,
+    ext_kegg_fib_up@result$ID
+  )
+  cat(
+    "\nFIBROSIS UP PATHWAY OVERLAP:",
+    length(fib_up_pathways),"\n"
+  )
+  print(
+    ekegg_up_fibrosis@result[
+      match(
+        fib_up_pathways,
+        ekegg_up_fibrosis@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+if(
+  exists("ekegg_down_fibrosis") &&
+  !is.null(ekegg_down_fibrosis) &&
+  !is.null(ext_kegg_fib_down)
+){
+  fib_down_pathways <- intersect(
+    ekegg_down_fibrosis@result$ID,
+    ext_kegg_fib_down@result$ID
+  )
+  cat(
+    "\nFIBROSIS DOWN PATHWAY OVERLAP:",
+    length(fib_down_pathways),"\n"
+  )
+  print(
+    ekegg_down_fibrosis@result[
+      match(
+        fib_down_pathways,
+        ekegg_down_fibrosis@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+# ============================================================
+# 16. STEATOSIS -> NAS PATHWAY SUPPORT
+# ============================================================
+if(
+  exists("ekegg_up_steatosis") &&
+  !is.null(ekegg_up_steatosis) &&
+  !is.null(ext_kegg_nas_up)
+){
+  steat_up_pathways <- intersect(
+    ekegg_up_steatosis@result$ID,
+    ext_kegg_nas_up@result$ID
+  )
+  cat(
+    "\nSTEATOSIS UP / NAS UP PATHWAY OVERLAP:",
+    length(steat_up_pathways),"\n"
+  )
+  print(
+    ekegg_up_steatosis@result[
+      match(
+        steat_up_pathways,
+        ekegg_up_steatosis@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+if(
+  exists("ekegg_down_steatosis") &&
+  !is.null(ekegg_down_steatosis) &&
+  !is.null(ext_kegg_nas_down)
+){
+  steat_down_pathways <- intersect(
+    ekegg_down_steatosis@result$ID,
+    ext_kegg_nas_down@result$ID
+  )
+  cat(
+    "\nSTEATOSIS DOWN / NAS DOWN PATHWAY OVERLAP:",
+    length(steat_down_pathways),"\n"
+  )
+  print(
+    ekegg_down_steatosis@result[
+      match(
+        steat_down_pathways,
+        ekegg_down_steatosis@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+# ============================================================
+# 17. INFLAMMATION -> NAS PATHWAY SUPPORT
+# ============================================================
+if(
+  exists("ekegg_up_inflammation") &&
+  !is.null(ekegg_up_inflammation) &&
+  !is.null(ext_kegg_nas_up)
+){
+  inf_up_pathways <- intersect(
+    ekegg_up_inflammation@result$ID,
+    ext_kegg_nas_up@result$ID
+  )
+  cat(
+    "\nINFLAMMATION UP / NAS UP PATHWAY OVERLAP:",
+    length(inf_up_pathways),"\n"
+  )
+  print(
+    ekegg_up_inflammation@result[
+      match(
+        inf_up_pathways,
+        ekegg_up_inflammation@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+if(
+  exists("ekegg_down_inflammation") &&
+  !is.null(ekegg_down_inflammation) &&
+  !is.null(ext_kegg_nas_down)
+){
+  inf_down_pathways <- intersect(
+    ekegg_down_inflammation@result$ID,
+    ext_kegg_nas_down@result$ID
+  )
+  cat(
+    "\nINFLAMMATION DOWN / NAS DOWN PATHWAY OVERLAP:",
+    length(inf_down_pathways),"\n"
+  )
+  print(
+    ekegg_down_inflammation@result[
+      match(
+        inf_down_pathways,
+        ekegg_down_inflammation@result$ID
+      ),
+      c("ID","Description")
+    ]
+  )
+}
+# ============================================================
+# 18. OPTIONAL PLOTS
+# ============================================================
+if(!is.null(ext_kegg_fib_up))
+  print(enrichplot::dotplot(
+    ext_kegg_fib_up,
+    showCategory=15,
+    title="GSE135251 Fibrosis UP"
+  ))
+if(!is.null(ext_kegg_fib_down))
+  print(enrichplot::dotplot(
+    ext_kegg_fib_down,
+    showCategory=15,
+    title="GSE135251 Fibrosis DOWN"
+  ))
+if(!is.null(ext_kegg_nas_up))
+  print(enrichplot::dotplot(
+    ext_kegg_nas_up,
+    showCategory=15,
+    title="GSE135251 NAS UP"
+  ))
+if(!is.null(ext_kegg_nas_down))
+  print(enrichplot::dotplot(
+    ext_kegg_nas_down,
+    showCategory=15,
+    title="GSE135251 NAS DOWN"
+  ))
+# ============================================================
+# GSE135251 VALIDATION FIGURE
+# A = LFC concordance
+# B = DEG overlap
+# C = directional concordance
+# D = replicated fibrosis KEGG pathways
+# ============================================================
+FDR_DESEQ <- 0.05
+FDR_KEGG <- 0.10
+MIN_COUNT <- 3
+# ============================================================
+# THEME
+# ============================================================
+theme_pub <- theme_bw(base_size=13) +
+  theme(
+    plot.title=element_text(face="bold",size=14,hjust=0.5),
+    plot.subtitle=element_text(size=11,hjust=0.5,color="grey30"),
+    axis.title=element_text(face="bold",size=12),
+    axis.text=element_text(color="black",size=10),
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_line(color="grey92"),
+    legend.title=element_text(face="bold",size=11),
+    legend.text=element_text(size=10),
+    strip.background=element_rect(fill="grey20"),
+    strip.text=element_text(color="white",face="bold")
+  )
+# ============================================================
+# PANEL A — LFC CONCORDANCE: FIBROSIS
+# ============================================================
+common_fib <- intersect(
+  rownames(resLFC_fibrosis),
+  rownames(res_fib_ext_ens)
+)
+df_fib <- data.frame(
+  Gene=common_fib,
+  Discovery_LFC=resLFC_fibrosis[common_fib,"log2FoldChange"],
+  Validation_LFC=res_fib_ext_ens[common_fib,"log2FoldChange"],
+  Discovery_padj=resLFC_fibrosis[common_fib,"padj"],
+  Validation_padj=res_fib_ext_ens[common_fib,"padj"]
+) %>%
+  filter(complete.cases(.)) %>%
+  mutate(
+    Status=case_when(
+      Discovery_padj<=FDR_DESEQ &
+        Validation_padj<=FDR_DESEQ &
+        sign(Discovery_LFC)==sign(Validation_LFC) ~
+        "Replicated (concordant)",
+      Discovery_padj<=FDR_DESEQ &
+        Validation_padj<=FDR_DESEQ &
+        sign(Discovery_LFC)!=sign(Validation_LFC) ~
+        "Discordant direction",
+      Discovery_padj<=FDR_DESEQ ~ "Discovery-only",
+      Validation_padj<=FDR_DESEQ ~ "Validation-only",
+      TRUE ~ "Not significant"
+    ),
+    Status=factor(
+      Status,
+      levels=c(
+        "Replicated (concordant)",
+        "Discordant direction",
+        "Discovery-only",
+        "Validation-only",
+        "Not significant"
+      )
+    )
+  )
+rho_fib <- cor.test(
+  df_fib$Discovery_LFC,
+  df_fib$Validation_LFC,
+  method="spearman"
+)
+same_dir_fib <- mean(
+  sign(df_fib$Discovery_LFC)==sign(df_fib$Validation_LFC)
+)*100
+label_genes <- df_fib %>%
+  filter(Status=="Replicated (concordant)") %>%
+  arrange(desc(abs(Discovery_LFC)+abs(Validation_LFC))) %>%
+  head(10)
+label_genes$Symbol <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys=label_genes$Gene,
+  column="SYMBOL",
+  keytype="ENSEMBL",
+  multiVals="first"
+)
+panel_A <- ggplot(
+  df_fib,
+  aes(x=Discovery_LFC,y=Validation_LFC)
+) +
+  annotate(
+    "rect",
+    xmin=0,xmax=Inf,ymin=0,ymax=Inf,
+    fill="#fddbc7",alpha=0.25
+  ) +
+  annotate(
+    "rect",
+    xmin=-Inf,xmax=0,ymin=-Inf,ymax=0,
+    fill="#d1e5f0",alpha=0.25
+  ) +
+  geom_hline(
+    yintercept=0,
+    linetype="dashed",
+    color="grey40"
+  ) +
+  geom_vline(
+    xintercept=0,
+    linetype="dashed",
+    color="grey40"
+  ) +
+  geom_point(
+    aes(color=Status,size=Status,alpha=Status)
+  ) +
+  geom_smooth(
+    method="lm",
+    se=TRUE,
+    color="#b2182b",
+    fill="#f4a582",
+    linewidth=1
+  ) +
+  ggrepel::geom_text_repel(
+    data=label_genes,
+    aes(label=Symbol),
+    size=3.4,
+    fontface="italic",
+    max.overlaps=20,
+    box.padding=0.5,
+    segment.color="grey50"
+  ) +
+  scale_color_manual(
+    values=c(
+      "Replicated (concordant)"="#b2182b",
+      "Discordant direction"="#878787",
+      "Discovery-only"="#4393c3",
+      "Validation-only"="#f4a582",
+      "Not significant"="grey80"
+    )
+  ) +
+  scale_size_manual(
+    values=c(3,2.5,1.8,1.8,0.8)
+  ) +
+  scale_alpha_manual(
+    values=c(0.95,0.8,0.6,0.6,0.25)
+  ) +
+  labs(
+    title="Fibrosis: Discovery vs GSE135251 Replication",
+    subtitle=paste0(
+      "Spearman \u03c1 = ",
+      round(rho_fib$estimate,3),
+      ", P = ",
+      format.pval(rho_fib$p.value,digits=3),
+      "  |  Same direction = ",
+      round(same_dir_fib,1),
+      "%  |  DESeq2 FDR <= ",
+      FDR_DESEQ
+    ),
+    x="log2FC \u2014 Discovery Cohort",
+    y="log2FC \u2014 GSE135251 (Validation)",
+    color="Gene status"
+  ) +
+  guides(size="none",alpha="none") +
+  theme_pub +
+  theme(legend.position="bottom")
+# ============================================================
+# PANEL B — VENN DIAGRAMS
+# ============================================================
+disc_fib_sig <- rownames(
+  subset(resLFC_fibrosis,padj<=FDR_DESEQ)
+)
+val_fib_sig <- rownames(
+  subset(res_fib_ext_ens,padj<=FDR_DESEQ)
+)
+disc_steat_sig <- rownames(
+  subset(resLFC_steatosis,padj<=FDR_DESEQ)
+)
+disc_infl_sig <- rownames(
+  subset(resLFC_inflammation,padj<=FDR_DESEQ)
+)
+val_nas_sig <- rownames(
+  subset(res_nas_ext_ens,padj<=FDR_DESEQ)
+)
+venn_fib_list <- list(
+  "Discovery\nFibrosis"=disc_fib_sig,
+  "GSE135251\nFibrosis"=val_fib_sig
+)
+venn_steat_list <- list(
+  "Discovery\nSteatosis"=disc_steat_sig,
+  "GSE135251\nNAS score"=val_nas_sig
+)
+venn_infl_list <- list(
+  "Discovery\nInflammation"=disc_infl_sig,
+  "GSE135251\nNAS score"=val_nas_sig
+)
+make_venn <- function(lst,title,fill_cols){
+  ggvenn(
+    lst,
+    fill_color=fill_cols,
+    stroke_size=0.6,
+    set_name_size=4,
+    text_size=5,
+    show_percentage=FALSE
+  ) +
+    ggtitle(title) +
+    theme(
+      plot.title=element_text(
+        face="bold",
+        hjust=0.5,
+        size=12
+      ),
+      panel.background=element_rect(
+        fill="white",
+        color=NA
+      )
+    )
+}
+venn_fib <- make_venn(
+  venn_fib_list,
+  "Fibrosis DEG Overlap (FDR ≤ 0.05)",
+  c("#b2182b","#4393c3")
+)
+venn_steat <- make_venn(
+  venn_steat_list,
+  "Steatosis vs NAS Overlap (FDR ≤ 0.05)",
+  c("#f4a582","#4393c3")
+)
+venn_infl <- make_venn(
+  venn_infl_list,
+  "Inflammation vs NAS Overlap (FDR ≤ 0.05)",
+  c("#92c5de","#4393c3")
+)
+panel_B <- plot_grid(
+  venn_fib,
+  venn_steat,
+  venn_infl,
+  ncol=3
+)
+# ============================================================
+# PANEL C — DIRECTIONAL REPLICATION
+# ============================================================
+get_stats <- function(
+  res_disc,
+  res_val,
+  fdr=FDR_DESEQ
+){
+  disc <- subset(
+    res_disc,
+    !is.na(padj) & padj<=fdr
+  )
+  val <- subset(
+    res_val,
+    !is.na(padj) & padj<=fdr
+  )
+  overlap <- intersect(
+    rownames(disc),
+    rownames(val)
+  )
+  if(length(overlap)<2){
+    return(
+      data.frame(
+        rho=NA,
+        p=NA,
+        pct_concordant=NA,
+        n=length(overlap),
+        binom_p=NA
+      )
+    )
+  }
+  x <- res_disc[
+    overlap,
+    "log2FoldChange"
+  ]
+  y <- res_val[
+    overlap,
+    "log2FoldChange"
+  ]
+  ok <- complete.cases(x,y)
+  x <- x[ok]
+  y <- y[ok]
+  rho <- cor.test(
+    x,
+    y,
+    method="spearman"
+  )
+  same <- sign(x)==sign(y)
+  binom <- binom.test(
+    sum(same),
+    length(same),
+    p=0.5,
+    alternative="greater"
+  )
+  data.frame(
+    rho=unname(rho$estimate),
+    p=rho$p.value,
+    pct_concordant=mean(same)*100,
+    n=length(same),
+    binom_p=binom$p.value
+  )
+}
+stats_fib <- get_stats(
+  resLFC_fibrosis,
+  res_fib_ext_ens
+)
+stats_steat <- get_stats(
+  resLFC_steatosis,
+  res_nas_ext_ens
+)
+stats_infl <- get_stats(
+  resLFC_inflammation,
+  res_nas_ext_ens
+)
+summary_df <- bind_rows(
+  cbind(
+    Trait="Fibrosis vs Fibrosis",
+    stats_fib
+  ),
+  cbind(
+    Trait="Steatosis vs NAS",
+    stats_steat
+  ),
+  cbind(
+    Trait="Inflammation vs NAS",
+    stats_infl
+  )
+) %>%
+  mutate(
+    Trait=factor(
+      Trait,
+      levels=rev(c(
+        "Fibrosis vs Fibrosis",
+        "Steatosis vs NAS",
+        "Inflammation vs NAS"
+      ))
+    ),
+    Significant=ifelse(
+      !is.na(binom_p) &
+        binom_p<0.05,
+      "Significant replication",
+      "Not significant"
+    ),
+    Label=paste0(
+      "n=",n,
+      "  \u03c1=",round(rho,2)
+    )
+  )
+panel_C <- ggplot(
+  summary_df,
+  aes(
+    x=pct_concordant,
+    y=Trait
+  )
+) +
+  geom_vline(
+    xintercept=50,
+    linetype="dashed",
+    color="grey40",
+    linewidth=0.8
+  ) +
+  geom_segment(
+    aes(
+      x=50,
+      xend=pct_concordant,
+      y=Trait,
+      yend=Trait,
+      color=Significant
+    ),
+    linewidth=2.2,
+    alpha=0.5
+  ) +
+  geom_point(
+    aes(
+      size=n,
+      color=Significant
+    )
+  ) +
+  geom_text(
+    aes(label=Label),
+    vjust=-1.3,
+    size=3.6,
+    fontface="bold"
+  ) +
+  scale_color_manual(
+    values=c(
+      "Significant replication"="#b2182b",
+      "Not significant"="grey60"
+    )
+  ) +
+  scale_size_continuous(
+    range=c(4,9),
+    guide="none"
+  ) +
+  xlim(30,100) +
+  labs(
+    title="Directional Replication Summary",
+    subtitle=paste0(
+      "DESeq2 FDR <= ",
+      FDR_DESEQ,
+      " both cohorts | dashed line = chance level"
+    ),
+    x="% Same-Direction Genes (Discovery vs Validation)",
+    y=NULL,
+    color=NULL
+  ) +
+  theme_pub +
+  theme(
+    legend.position="bottom",
+    axis.text.y=element_text(
+      face="bold",
+      size=12
+    )
+  )
+# ============================================================
+# PANEL D — REPLICATED FIBROSIS KEGG PATHWAYS
+# ============================================================
+build_kegg_compare_df <- function(
+  disc_kegg,
+  ext_kegg,
+  direction_label
+){
+  if(
+    is.null(disc_kegg) ||
+    is.null(ext_kegg)
+  )
+    return(NULL)
+  if(
+    nrow(disc_kegg@result)==0 ||
+    nrow(ext_kegg@result)==0
+  )
+    return(NULL)
+  shared <- intersect(
+    disc_kegg@result$ID,
+    ext_kegg@result$ID
+  )
+  if(length(shared)==0)
+    return(NULL)
+  d <- disc_kegg@result %>%
+    filter(ID %in% shared) %>%
+    transmute(
+      ID,
+      Description,
+      Cohort="Discovery",
+      p.adjust,
+      Count
+    )
+  v <- ext_kegg@result %>%
+    filter(ID %in% shared) %>%
+    transmute(
+      ID,
+      Description,
+      Cohort="GSE135251",
+      p.adjust,
+      Count
+    )
+  bind_rows(d,v) %>%
+    mutate(Direction=direction_label)
+}
+kegg_compare_up <- build_kegg_compare_df(
+  ekegg_up_fibrosis,
+  ext_kegg_fib_up,
+  "Up"
+)
+kegg_compare_down <- build_kegg_compare_df(
+  ekegg_down_fibrosis,
+  ext_kegg_fib_down,
+  "Down"
+)
+kegg_compare_all <- bind_rows(
+  kegg_compare_up,
+  kegg_compare_down
+)
+if(
+  nrow(kegg_compare_all)>0
+){
+  kegg_compare_all <- kegg_compare_all %>%
+    group_by(ID) %>%
+    filter(all(Count>=MIN_COUNT)) %>%
+    ungroup()
+}
+# ============================================================
+# KEGG CATEGORY
+# ============================================================
+get_kegg_category <- function(pathway_id){
+  info <- tryCatch(
+    keggGet(pathway_id)[[1]],
+    error=function(e) NULL
+  )
+  if(!is.null(info$CLASS))
+    info$CLASS[1]
+  else
+    NA
+}
+if(
+  nrow(kegg_compare_all)>0
+){
+  unique_ids <- unique(
+    kegg_compare_all$ID
+  )
+  categories <- sapply(
+    unique_ids,
+    get_kegg_category
+  )
+  category_df <- data.frame(
+    ID=unique_ids,
+    Category=categories,
+    stringsAsFactors=FALSE
+  ) %>%
+    mutate(
+      Main_Category=sapply(
+        strsplit(Category,";"),
+        `[`,
+        1
+      ),
+      Sub_Category=sapply(
+        strsplit(Category,";"),
+        `[`,
+        2
+      )
+    )
+  category_df$Main_Category[
+    category_df$ID=="hsa04820"
+  ] <- "Cellular Processes"
+  kegg_compare_all <- kegg_compare_all %>%
+    left_join(
+      category_df[,c(
+        "ID",
+        "Main_Category"
+      )],
+      by="ID"
+    ) %>%
+    mutate(
+      Main_Category=ifelse(
+        is.na(Main_Category),
+        "Unclassified",
+        Main_Category
+      )
+    )
+}
+# ============================================================
+# PANEL D PLOT
+# ============================================================
+if(
+  nrow(kegg_compare_all)>0
+){
+  kegg_compare_all <- kegg_compare_all %>%
+    mutate(
+      neglog10p=-log10(p.adjust),
+      Description=factor(
+        Description,
+        levels=rev(unique(Description))
+      ),
+      Direction=factor(
+        Direction,
+        levels=c("Up","Down")
+      )
+    )
+  panel_D <- ggplot(
+    kegg_compare_all,
+    aes(
+      x=Cohort,
+      y=Description,
+      size=neglog10p,
+      color=Direction
+    )
+  ) +
+    geom_point(alpha=0.85) +
+    facet_grid(
+      Main_Category~.,
+      scales="free_y",
+      space="free_y"
+    ) +
+    scale_color_manual(
+      values=c(
+        "Up"="#ffa500ff",
+        "Down"="#4575B4"
+      )
+    ) +
+    scale_size_continuous(
+      range=c(3,9),
+      name="-log10(FDR)"
+    ) +
+    labs(
+      title="Replicated KEGG Pathways (Fibrosis)",
+      subtitle=paste0(
+        "Pathways significant in BOTH cohorts, ",
+        "KEGG q-value < ",
+        FDR_KEGG,
+        ", Count \u2265 ",
+        MIN_COUNT
+      ),
+      x=NULL,
+      y=NULL,
+      color="Direction"
+    ) +
+    theme_pub +
+    theme(
+      axis.text.y=element_text(size=10),
+      strip.text.y=element_text(
+        angle=0,
+        size=11,
+        face="bold"
+      ),
+      legend.position="bottom",
+      panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank()
+    )
+} else {
+  panel_D <- ggplot() +
+    annotate(
+      "text",
+      x=0.5,
+      y=0.5,
+      label=paste0(
+        "No overlapping KEGG pathways\n",
+        "(Count \u2265 ",
+        MIN_COUNT,
+        ") between cohorts"
+      ),
+      size=5,
+      fontface="italic"
+    ) +
+    theme_void() +
+    ggtitle(
+      "Replicated KEGG Pathways (Fibrosis)"
+    ) +
+    theme(
+      plot.title=element_text(
+        face="bold",
+        hjust=0.5,
+        size=14
+      )
+    )
+}
+# ============================================================
+# COMBINE FINAL FIGURE
+# ============================================================
+bottom_row <- plot_grid(
+  panel_C,
+  panel_D,
+  ncol=2,
+  rel_widths=c(1,1.3),
+  labels=c("C","D"),
+  label_size=18
+)
+final_validation_figure <- plot_grid(
+  panel_A,
+  panel_B,
+  bottom_row,
+  ncol=1,
+  rel_heights=c(1.3,0.9,1.1),
+  labels=c("A","B",""),
+  label_size=18
+)
+final_validation_figure
+# ---- after running the GSE135251 (unadjusted) chunk, BEFORE sex-adj chunk ----
+val_GSE135251_unadj <- list(
+  label         = "GSE135251",
+  fib_res       = as.data.frame(res_fib_ext_ens),
+  nas_res       = as.data.frame(res_nas_ext_ens),
+  kegg_fib_up   = ext_kegg_fib_up,
+  kegg_fib_down = ext_kegg_fib_down,
+  kegg_nas_up   = ext_kegg_nas_up,
+  kegg_nas_down = ext_kegg_nas_down
+)
+```
+
+#### SEX adjusted
+
+```{r external-04}
+# ============================================================
+# GSE135251 EXTERNAL VALIDATION WITH SEX ADJUSTMENT
+#
+# Internal:
+# Steatosis    = 0 vs 1+2+3+4
+# Inflammation = 0 vs 1+2+3+4
+# Fibrosis     = 0 vs 1+2+3+4
+#
+# External:
+# Fibrosis    = F0 vs F1-F4
+# Steatosis   = supporting validation using NAS
+# Inflammation= supporting validation using NAS
+#
+# Sex inferred from sex-specific RNA expression
+# Models:
+#   Fibrosis ~ Sex + Fibrosis
+#   NAS       ~ Sex + NAS_score
+#
+# Gene FDR ≤ 0.05
+# KEGG qvalue <= 0.10
+# ============================================================
+FDR_DEG <- 0.05
+FDR_PATH <- 0.10
+MIN_COUNT <- 3
+# ============================================================
+# 1. GEO PHENOTYPE
+# ============================================================
+gse <- getGEO(
+  "GSE135251",
+  GSEMatrix=TRUE
+)[[1]]
+pheno <- pData(gse)
+pheno$Fibrosis_stage <- as.numeric(
+  pheno$`fibrosis stage:ch1`
+)
+pheno$NAS_score <- as.numeric(
+  pheno$`nas score:ch1`
+)
+cat("\nFIBROSIS STAGE\n")
+print(table(pheno$Fibrosis_stage,useNA="ifany"))
+cat("\nNAS SCORE\n")
+print(table(pheno$NAS_score,useNA="ifany"))
+# ============================================================
+# 2. COUNTS
+# ============================================================
+count_file <- file.path(project_dir, "Analyisis/GSE135251_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+counts_df <- read.delim(
+  gzfile(count_file),
+  header=TRUE,
+  check.names=FALSE,
+  stringsAsFactors=FALSE
+)
+gene_ids <- sub(
+  "\\..*$",
+  "",
+  counts_df[[1]]
+)
+counts <- as.matrix(
+  counts_df[,-1,drop=FALSE]
+)
+storage.mode(counts) <- "numeric"
+rownames(counts) <- gene_ids
+# ============================================================
+# 3. MATCH COUNTS TO GEO
+# ============================================================
+common <- intersect(
+  colnames(counts),
+  rownames(pheno)
+)
+if(length(common)>0){
+  counts <- counts[,common,drop=FALSE]
+  pheno <- pheno[common,,drop=FALSE]
+} else {
+  count_key <- gsub(
+    "\\s+",
+    "",
+    colnames(counts)
+  )
+  title_key <- gsub(
+    "\\s+",
+    "",
+    pheno$title
+  )
+  idx <- match(
+    count_key,
+    title_key
+  )
+  keep <- !is.na(idx)
+  counts <- counts[
+    ,
+    keep,
+    drop=FALSE
+  ]
+  pheno <- pheno[
+    idx[keep],
+    ,
+    drop=FALSE
+  ]
+  colnames(counts) <- rownames(pheno)
+}
+stopifnot(
+  identical(
+    colnames(counts),
+    rownames(pheno)
+  )
+)
+cat(
+  "\nMatched samples:",
+  ncol(counts),
+  "\n"
+)
+# ============================================================
+# 4. INFER SEX FROM SEX-SPECIFIC GENES
+# ============================================================
+sex_genes <- c(
+  "RPS4Y1",
+  "DDX3Y",
+  "KDM5D",
+  "UTY",
+  "XIST"
+)
+sex_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys=sex_genes,
+  keytype="SYMBOL",
+  columns=c("SYMBOL","ENTREZID")
+)
+sex_map <- sex_map[
+  !is.na(sex_map$ENTREZID) &
+    !duplicated(sex_map$SYMBOL),
+  ,
+  drop=FALSE
+]
+print(sex_map)
+# Check whether counts use Entrez IDs
+present_entrez <- intersect(
+  as.character(sex_map$ENTREZID),
+  rownames(counts)
+)
+cat(
+  "\nSex-marker genes present in counts:",
+  length(present_entrez),
+  "\n"
+)
+print(present_entrez)
+if(length(present_entrez)<3)
+  stop("Too few sex-specific genes were found in the count matrix.")
+# Preliminary DESeq2 object for normalization
+dds_sex <- DESeqDataSetFromMatrix(
+  countData=round(counts),
+  colData=pheno,
+  design=~1
+)
+dds_sex <- estimateSizeFactors(dds_sex)
+norm_counts <- counts(
+  dds_sex,
+  normalized=TRUE
+)
+# Marker counts
+marker_counts <- norm_counts[
+  present_entrez,
+  ,
+  drop=FALSE
+]
+# Convert rownames back to gene symbols
+marker_symbols <- sex_map$SYMBOL[
+  match(
+    present_entrez,
+    as.character(sex_map$ENTREZID)
+  )
+]
+rownames(marker_counts) <- marker_symbols
+# log2 expression
+marker_log <- log2(
+  marker_counts + 1
+)
+# z-score each marker across samples
+marker_z <- t(
+  scale(
+    t(marker_log)
+  )
+)
+# Y-chromosome markers = male signal
+male_genes <- intersect(
+  c("RPS4Y1","DDX3Y","KDM5D","UTY"),
+  rownames(marker_z)
+)
+# XIST = female-associated signal
+female_genes <- intersect(
+  "XIST",
+  rownames(marker_z)
+)
+cat("\nMale markers used:\n")
+print(male_genes)
+cat("\nFemale marker used:\n")
+print(female_genes)
+if(length(male_genes)<2)
+  stop("Too few Y-chromosome markers available.")
+male_score <- colMeans(
+  marker_z[
+    male_genes,
+    ,
+    drop=FALSE
+  ],
+  na.rm=TRUE
+)
+female_score <- if(length(female_genes)>0){
+  colMeans(
+    marker_z[
+      female_genes,
+      ,
+      drop=FALSE
+    ],
+    na.rm=TRUE
+  )
+} else {
+  rep(
+    0,
+    ncol(marker_z)
+  )
+}
+sex_score <- male_score - female_score
+pheno$Sex <- factor(
+  ifelse(
+    sex_score>0,
+    "Male",
+    "Female"
+  ),
+  levels=c(
+    "Female",
+    "Male"
+  )
+)
+cat("\nINFERRED SEX\n")
+print(table(pheno$Sex))
+# ============================================================
+# 5. FIBROSIS GROUP
+# ============================================================
+pheno$Fibrosis <- factor(
+  ifelse(
+    pheno$Fibrosis_stage==0,
+    "F0",
+    ifelse(
+      pheno$Fibrosis_stage %in% 1:4,
+      "F1_F4",
+      NA
+    )
+  ),
+  levels=c("F0","F1_F4")
+)
+cat("\nFIBROSIS GROUPS\n")
+print(
+  table(
+    pheno$Fibrosis,
+    useNA="ifany"
+  )
+)
+# Check Sex x Fibrosis
+cat("\nSEX BY FIBROSIS\n")
+print(
+  table(
+    pheno$Sex,
+    pheno$Fibrosis,
+    useNA="ifany"
+  )
+)
+# ============================================================
+# 6. FIBROSIS DESEQ2
+# ============================================================
+keep <- !is.na(pheno$Fibrosis) &
+  !is.na(pheno$Sex)
+pheno_fib <- pheno[
+  keep,
+  ,
+  drop=FALSE
+]
+counts_fib <- counts[
+  ,
+  rownames(pheno_fib),
+  drop=FALSE
+]
+keep_gene <- rowSums(
+  counts_fib>=10
+)>=10
+counts_fib <- counts_fib[
+  keep_gene,
+  ,
+  drop=FALSE
+]
+dds_fib <- DESeqDataSetFromMatrix(
+  countData=round(counts_fib),
+  colData=pheno_fib,
+  design=~Sex+Fibrosis
+)
+dds_fib <- DESeq(dds_fib)
+cat("\nFIBROSIS RESULTS NAMES\n")
+print(resultsNames(dds_fib))
+fib_coef <- grep(
+  "^Fibrosis_",
+  resultsNames(dds_fib),
+  value=TRUE
+)
+if(length(fib_coef)!=1)
+  stop("Fibrosis coefficient could not be uniquely identified.")
+res_fib_ext <- results(
+  dds_fib,
+  name=fib_coef,
+  alpha=FDR_DEG
+)
+res_fib_ext <- res_fib_ext[
+  !is.na(res_fib_ext$padj),
+  ,
+  drop=FALSE
+]
+resLFC_fib_ext <- lfcShrink(
+  dds_fib,
+  coef=fib_coef,
+  type="apeglm"
+)
+resLFC_fib_ext <- resLFC_fib_ext[
+  !is.na(resLFC_fib_ext$padj),
+  ,
+  drop=FALSE
+]
+# ============================================================
+# 7. EXTERNAL FIBROSIS DEGs
+# ============================================================
+ext_fib_up <- rownames(
+  subset(
+    resLFC_fib_ext,
+    padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_fib_down <- rownames(
+  subset(
+    resLFC_fib_ext,
+    padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+cat(
+  "\nGSE135251 FIBROSIS DEGs\n",
+  "Total:",length(c(
+    ext_fib_up,
+    ext_fib_down
+  )),"\n",
+  "UP:",length(ext_fib_up),"\n",
+  "DOWN:",length(ext_fib_down),"\n"
+)
+# ============================================================
+# 8. ENTrez -> ENSEMBL
+# ============================================================
+convert_entrez_to_ensembl <- function(res){
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys=rownames(res),
+    keytype="ENTREZID",
+    columns=c("ENSEMBL","SYMBOL")
+  )
+  map <- map[
+    !is.na(map$ENSEMBL) &
+      !duplicated(map$ENTREZID),
+    ,
+    drop=FALSE
+  ]
+  x <- as.data.frame(res)
+  x$ENTREZID <- rownames(x)
+  x$ENSEMBL <- map$ENSEMBL[
+    match(
+      x$ENTREZID,
+      map$ENTREZID
+    )
+  ]
+  x <- x[
+    !is.na(x$ENSEMBL),
+    ,
+    drop=FALSE
+  ]
+  x <- x[
+    !duplicated(x$ENSEMBL),
+    ,
+    drop=FALSE
+  ]
+  rownames(x) <- x$ENSEMBL
+  x
+}
+res_fib_ext_ens <- convert_entrez_to_ensembl(
+  resLFC_fib_ext
+)
+cat(
+  "\nExternal fibrosis genes after Ensembl conversion:",
+  nrow(res_fib_ext_ens),
+  "\n"
+)
+# ============================================================
+# 9. INTERNAL vs EXTERNAL FIBROSIS
+# ============================================================
+int_fib_up <- rownames(
+  subset(
+    resLFC_fibrosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_fib_down <- rownames(
+  subset(
+    resLFC_fibrosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+ext_fib_up <- rownames(
+  subset(
+    res_fib_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_fib_down <- rownames(
+  subset(
+    res_fib_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+fib_up_rep <- intersect(
+  int_fib_up,
+  ext_fib_up
+)
+fib_down_rep <- intersect(
+  int_fib_down,
+  ext_fib_down
+)
+cat(
+  "\nFIBROSIS VALIDATION\n",
+  "Internal UP:",length(int_fib_up),"\n",
+  "Internal DOWN:",length(int_fib_down),"\n",
+  "External UP:",length(ext_fib_up),"\n",
+  "External DOWN:",length(ext_fib_down),"\n",
+  "UP/UP:",length(fib_up_rep),"\n",
+  "DOWN/DOWN:",length(fib_down_rep),"\n"
+)
+# ============================================================
+# 10. FIBROSIS EFFECT-SIZE CONCORDANCE
+# ============================================================
+fib_overlap <- intersect(
+  rownames(
+    subset(
+      resLFC_fibrosis,
+      !is.na(padj) &
+        padj<=FDR_DEG
+    )
+  ),
+  rownames(
+    subset(
+      res_fib_ext_ens,
+      !is.na(padj) &
+        padj<=FDR_DEG
+    )
+  )
+)
+fib_x <- resLFC_fibrosis[
+  fib_overlap,
+  "log2FoldChange"
+]
+fib_y <- res_fib_ext_ens[
+  fib_overlap,
+  "log2FoldChange"
+]
+ok <- complete.cases(
+  fib_x,
+  fib_y
+)
+fib_x <- fib_x[ok]
+fib_y <- fib_y[ok]
+same_fib <- sign(fib_x)==sign(fib_y)
+fib_cor <- cor.test(
+  fib_x,
+  fib_y,
+  method="spearman"
+)
+fib_binom <- binom.test(
+  sum(same_fib),
+  length(same_fib),
+  p=0.5,
+  alternative="greater"
+)
+cat(
+  "\nFIBROSIS EFFECT CONCORDANCE\n",
+  "Overlap:",length(fib_x),"\n",
+  "Spearman rho:",
+  round(
+    unname(fib_cor$estimate),
+    3
+  ),"\n",
+  "Spearman P:",
+  format.pval(
+    fib_cor$p.value,
+    digits=4
+  ),"\n",
+  "Same direction:",
+  round(
+    100*mean(same_fib),
+    2
+  ),"%\n",
+  "Binomial P:",
+  format.pval(
+    fib_binom$p.value,
+    digits=4
+  ),"\n"
+)
+# ============================================================
+# 11. NAS ANALYSIS ADJUSTED FOR SEX
+# ============================================================
+pheno_nas <- pheno[
+  !is.na(pheno$NAS_score) &
+    !is.na(pheno$Sex),
+  ,
+  drop=FALSE
+]
+counts_nas <- counts[
+  ,
+  rownames(pheno_nas),
+  drop=FALSE
+]
+keep_gene <- rowSums(
+  counts_nas>=10
+)>=10
+counts_nas <- counts_nas[
+  keep_gene,
+  ,
+  drop=FALSE
+]
+dds_nas <- DESeqDataSetFromMatrix(
+  countData=round(counts_nas),
+  colData=pheno_nas,
+  design=~Sex+NAS_score
+)
+dds_nas <- DESeq(dds_nas)
+cat("\nNAS RESULTS NAMES\n")
+print(resultsNames(dds_nas))
+nas_coef <- grep(
+  "NAS_score",
+  resultsNames(dds_nas),
+  value=TRUE
+)
+if(length(nas_coef)!=1)
+  stop("NAS coefficient could not be uniquely identified.")
+res_nas_ext <- results(
+  dds_nas,
+  name=nas_coef,
+  alpha=FDR_DEG
+)
+res_nas_ext <- res_nas_ext[
+  !is.na(res_nas_ext$padj),
+  ,
+  drop=FALSE
+]
+resLFC_nas_ext <- lfcShrink(
+  dds_nas,
+  coef=nas_coef,
+  type="apeglm"
+)
+resLFC_nas_ext <- resLFC_nas_ext[
+  !is.na(resLFC_nas_ext$padj),
+  ,
+  drop=FALSE
+]
+cat(
+  "\nNAS-associated genes:",
+  nrow(resLFC_nas_ext),
+  "\n"
+)
+# ============================================================
+# 12. NAS ENTrez -> ENSEMBL
+# ============================================================
+res_nas_ext_ens <- convert_entrez_to_ensembl(
+  resLFC_nas_ext
+)
+cat(
+  "External NAS genes after Ensembl conversion:",
+  nrow(res_nas_ext_ens),
+  "\n"
+)
+# ============================================================
+# 13. STEATOSIS -> NAS
+# ============================================================
+int_steat_up <- rownames(
+  subset(
+    resLFC_steatosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_steat_down <- rownames(
+  subset(
+    resLFC_steatosis,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+ext_nas_up <- rownames(
+  subset(
+    res_nas_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+ext_nas_down <- rownames(
+  subset(
+    res_nas_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+steat_up_rep <- intersect(
+  int_steat_up,
+  ext_nas_up
+)
+steat_down_rep <- intersect(
+  int_steat_down,
+  ext_nas_down
+)
+cat(
+  "\nSTEATOSIS -> NAS SUPPORT\n",
+  "Internal UP:",length(int_steat_up),"\n",
+  "Internal DOWN:",length(int_steat_down),"\n",
+  "External NAS UP:",length(ext_nas_up),"\n",
+  "External NAS DOWN:",length(ext_nas_down),"\n",
+  "UP/UP:",length(steat_up_rep),"\n",
+  "DOWN/DOWN:",length(steat_down_rep),"\n"
+)
+# ============================================================
+# 14. INFLAMMATION -> NAS
+# ============================================================
+int_inf_up <- rownames(
+  subset(
+    resLFC_inflammation,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange>0
+  )
+)
+int_inf_down <- rownames(
+  subset(
+    resLFC_inflammation,
+    !is.na(padj) &
+      padj<=FDR_DEG &
+      log2FoldChange<0
+  )
+)
+inf_up_rep <- intersect(
+  int_inf_up,
+  ext_nas_up
+)
+inf_down_rep <- intersect(
+  int_inf_down,
+  ext_nas_down
+)
+cat(
+  "\nINFLAMMATION -> NAS SUPPORT\n",
+  "Internal UP:",length(int_inf_up),"\n",
+  "Internal DOWN:",length(int_inf_down),"\n",
+  "External NAS UP:",length(ext_nas_up),"\n",
+  "External NAS DOWN:",length(ext_nas_down),"\n",
+  "UP/UP:",length(inf_up_rep),"\n",
+  "DOWN/DOWN:",length(inf_down_rep),"\n"
+)
+# ============================================================
+# 15. KEGG
+# ============================================================
+run_kegg <- function(res,direction){
+  genes <- if(direction=="up"){
+    rownames(
+      subset(
+        res,
+        !is.na(padj) &
+          padj<=FDR_DEG &
+          log2FoldChange>0
+      )
+    )
+  } else {
+    rownames(
+      subset(
+        res,
+        !is.na(padj) &
+          padj<=FDR_DEG &
+          log2FoldChange<0
+      )
+    )
+  }
+  genes <- sub(
+    "\\..*$",
+    "",
+    genes
+  )
+  genes <- unique(
+    genes[
+      grepl("^ENSG",genes)
+    ]
+  )
+  if(length(genes)<5)
+    return(NULL)
+  map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys=genes,
+    keytype="ENSEMBL",
+    columns="ENTREZID"
+  )
+  entrez <- unique(
+    map$ENTREZID[
+      !is.na(map$ENTREZID)
+    ]
+  )
+  if(length(entrez)<5)
+    return(NULL)
+  ek <- enrichKEGG(
+    gene=entrez,
+    organism="hsa",
+    pvalueCutoff=FDR_PATH
+  )
+  if(is.null(ek))
+    return(NULL)
+  ek@result <- subset(
+    ek@result,
+    qvalue<=FDR_PATH
+  )
+  ek
+}
+# ============================================================
+# 16. EXTERNAL KEGG
+# ============================================================
+ext_kegg_fib_up <- run_kegg(
+  res_fib_ext_ens,
+  "up"
+)
+ext_kegg_fib_down <- run_kegg(
+  res_fib_ext_ens,
+  "down"
+)
+ext_kegg_nas_up <- run_kegg(
+  res_nas_ext_ens,
+  "up"
+)
+ext_kegg_nas_down <- run_kegg(
+  res_nas_ext_ens,
+  "down"
+)
+# ============================================================
+# 17. DIRECT TRYptophan metabolism CHECK
+# hsa00380
+# ============================================================
+check_tryptophan <- function(ek){
+  if(is.null(ek))
+    return(NULL)
+  ek@result[
+    ek@result$ID=="hsa00380",
+    c(
+      "ID",
+      "Description",
+      "GeneRatio",
+      "BgRatio",
+      "pvalue",
+      "p.adjust",
+      "qvalue",
+      "Count"
+    ),
+    drop=FALSE
+  ]
+}
+cat("\nTRYPTOPHAN METABOLISM - FIBROSIS UP\n")
+print(
+  check_tryptophan(ext_kegg_fib_up)
+)
+cat("\nTRYPTOPHAN METABOLISM - FIBROSIS DOWN\n")
+print(
+  check_tryptophan(ext_kegg_fib_down)
+)
+cat("\nTRYPTOPHAN METABOLISM - NAS UP\n")
+print(
+  check_tryptophan(ext_kegg_nas_up)
+)
+cat("\nTRYPTOPHAN METABOLISM - NAS DOWN\n")
+print(
+  check_tryptophan(ext_kegg_nas_down)
+)
+# ============================================================
+# 18. PATHWAY REPLICATION
+# ============================================================
+get_pathway_overlap <- function(
+  discovery,
+  external
+){
+  if(
+    is.null(discovery) ||
+    is.null(external)
+  )
+    return(character(0))
+  intersect(
+    discovery@result$ID,
+    external@result$ID
+  )
+}
+fib_up_pathways <- get_pathway_overlap(
+  ekegg_up_fibrosis,
+  ext_kegg_fib_up
+)
+fib_down_pathways <- get_pathway_overlap(
+  ekegg_down_fibrosis,
+  ext_kegg_fib_down
+)
+steat_up_pathways <- get_pathway_overlap(
+  ekegg_up_steatosis,
+  ext_kegg_nas_up
+)
+steat_down_pathways <- get_pathway_overlap(
+  ekegg_down_steatosis,
+  ext_kegg_nas_down
+)
+inf_up_pathways <- get_pathway_overlap(
+  ekegg_up_inflammation,
+  ext_kegg_nas_up
+)
+inf_down_pathways <- get_pathway_overlap(
+  ekegg_down_inflammation,
+  ext_kegg_nas_down
+)
+cat(
+  "\nKEGG PATHWAY OVERLAP\n",
+  "Fibrosis UP:",length(fib_up_pathways),"\n",
+  "Fibrosis DOWN:",length(fib_down_pathways),"\n",
+  "Steatosis UP / NAS UP:",length(steat_up_pathways),"\n",
+  "Steatosis DOWN / NAS DOWN:",length(steat_down_pathways),"\n",
+  "Inflammation UP / NAS UP:",length(inf_up_pathways),"\n",
+  "Inflammation DOWN / NAS DOWN:",length(inf_down_pathways),"\n"
+)
+# ============================================================
+# 19. PLOT THEME
+# ============================================================
+theme_pub <- theme_bw(
+  base_size=13
+) +
+  theme(
+    plot.title=element_text(
+      face="bold",
+      size=14,
+      hjust=0.5
+    ),
+    plot.subtitle=element_text(
+      size=11,
+      hjust=0.5,
+      color="grey30"
+    ),
+    axis.title=element_text(
+      face="bold",
+      size=12
+    ),
+    axis.text=element_text(
+      color="black",
+      size=10
+    ),
+    panel.grid.minor=element_blank(),
+    panel.grid.major=element_line(
+      color="grey92"
+    ),
+    legend.title=element_text(
+      face="bold",
+      size=11
+    ),
+    legend.text=element_text(
+      size=10
+    ),
+    strip.background=element_rect(
+      fill="grey20"
+    ),
+    strip.text=element_text(
+      color="white",
+      face="bold"
+    )
+  )
+# ============================================================
+# 20. PANEL A — FIBROSIS LFC CONCORDANCE
+# ============================================================
+common_fib <- intersect(
+  rownames(resLFC_fibrosis),
+  rownames(res_fib_ext_ens)
+)
+df_fib <- data.frame(
+  Gene=common_fib,
+  Discovery_LFC=
+    resLFC_fibrosis[
+      common_fib,
+      "log2FoldChange"
+    ],
+  Validation_LFC=
+    res_fib_ext_ens[
+      common_fib,
+      "log2FoldChange"
+    ],
+  Discovery_padj=
+    resLFC_fibrosis[
+      common_fib,
+      "padj"
+    ],
+  Validation_padj=
+    res_fib_ext_ens[
+      common_fib,
+      "padj"
+    ]
+) %>%
+  filter(
+    complete.cases(.)
+  ) %>%
+  mutate(
+    Status=case_when(
+      Discovery_padj<=FDR_DESEQ &
+        Validation_padj<=FDR_DESEQ &
+        sign(Discovery_LFC)==sign(Validation_LFC) ~
+        "Replicated (concordant)",
+      Discovery_padj<=FDR_DESEQ &
+        Validation_padj<=FDR_DESEQ &
+        sign(Discovery_LFC)!=sign(Validation_LFC) ~
+        "Discordant direction",
+      Discovery_padj<=FDR_DESEQ ~
+        "Discovery-only",
+      Validation_padj<=FDR_DESEQ ~
+        "Validation-only",
+      TRUE ~ "Not significant"
+    ),
+    Status=factor(
+      Status,
+      levels=c(
+        "Replicated (concordant)",
+        "Discordant direction",
+        "Discovery-only",
+        "Validation-only",
+        "Not significant"
+      )
+    )
+  )
+rho_fib <- cor.test(
+  df_fib$Discovery_LFC,
+  df_fib$Validation_LFC,
+  method="spearman"
+)
+same_dir_fib <- mean(
+  sign(df_fib$Discovery_LFC)==
+    sign(df_fib$Validation_LFC)
+)*100
+label_genes <- df_fib %>%
+  filter(
+    Status=="Replicated (concordant)"
+  ) %>%
+  arrange(
+    desc(
+      abs(Discovery_LFC)+
+        abs(Validation_LFC)
+    )
+  ) %>%
+  head(10)
+label_genes$Symbol <- AnnotationDbi::mapIds(
+  org.Hs.eg.db,
+  keys=label_genes$Gene,
+  column="SYMBOL",
+  keytype="ENSEMBL",
+  multiVals="first"
+)
+panel_A <- ggplot(
+  df_fib,
+  aes(
+    x=Discovery_LFC,
+    y=Validation_LFC
+  )
+) +
+  annotate(
+    "rect",
+    xmin=0,
+    xmax=Inf,
+    ymin=0,
+    ymax=Inf,
+    fill="#fddbc7",
+    alpha=0.25
+  ) +
+  annotate(
+    "rect",
+    xmin=-Inf,
+    xmax=0,
+    ymin=-Inf,
+    ymax=0,
+    fill="#d1e5f0",
+    alpha=0.25
+  ) +
+  geom_hline(
+    yintercept=0,
+    linetype="dashed",
+    color="grey40"
+  ) +
+  geom_vline(
+    xintercept=0,
+    linetype="dashed",
+    color="grey40"
+  ) +
+  geom_point(
+    aes(
+      color=Status,
+      size=Status,
+      alpha=Status
+    )
+  ) +
+  geom_smooth(
+    method="lm",
+    se=TRUE,
+    color="#b2182b",
+    fill="#f4a582",
+    linewidth=1
+  ) +
+  ggrepel::geom_text_repel(
+    data=label_genes,
+    aes(label=Symbol),
+    size=3.4,
+    fontface="italic",
+    max.overlaps=20,
+    box.padding=0.5,
+    segment.color="grey50"
+  ) +
+  scale_color_manual(
+    values=c(
+      "Replicated (concordant)"="#b2182b",
+      "Discordant direction"="#878787",
+      "Discovery-only"="#4393c3",
+      "Validation-only"="#f4a582",
+      "Not significant"="grey80"
+    )
+  ) +
+  scale_size_manual(
+    values=c(
+      3,
+      2.5,
+      1.8,
+      1.8,
+      0.8
+    )
+  ) +
+  scale_alpha_manual(
+    values=c(
+      0.95,
+      0.8,
+      0.6,
+      0.6,
+      0.25
+    )
+  ) +
+  labs(
+    title=
+      "Fibrosis: Discovery vs GSE135251 Replication",
+    subtitle=paste0(
+      "Sex-adjusted external model | Spearman \u03c1 = ",
+      round(
+        rho_fib$estimate,
+        3
+      ),
+      ", P = ",
+      format.pval(
+        rho_fib$p.value,
+        digits=3
+      ),
+      " | Same direction = ",
+      round(
+        same_dir_fib,
+        1
+      ),
+      "% | FDR <= ",
+      FDR_DESEQ
+    ),
+    x="log2FC \u2014 Discovery Cohort",
+    y="log2FC \u2014 GSE135251",
+    color="Gene status"
+  ) +
+  guides(
+    size="none",
+    alpha="none"
+  ) +
+  theme_pub +
+  theme(
+    legend.position="bottom"
+  )
+# ============================================================
+# 21. PANEL B — VENN
+# ============================================================
+disc_fib_sig <- rownames(
+  subset(
+    resLFC_fibrosis,
+    !is.na(padj) &
+      padj<=FDR_DESEQ
+  )
+)
+val_fib_sig <- rownames(
+  subset(
+    res_fib_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DESEQ
+  )
+)
+disc_steat_sig <- rownames(
+  subset(
+    resLFC_steatosis,
+    !is.na(padj) &
+      padj<=FDR_DESEQ
+  )
+)
+disc_infl_sig <- rownames(
+  subset(
+    resLFC_inflammation,
+    !is.na(padj) &
+      padj<=FDR_DESEQ
+  )
+)
+val_nas_sig <- rownames(
+  subset(
+    res_nas_ext_ens,
+    !is.na(padj) &
+      padj<=FDR_DESEQ
+  )
+)
+make_venn <- function(
+  lst,
+  title,
+  fill_cols
+){
+  ggvenn(
+    lst,
+    fill_color=fill_cols,
+    stroke_size=0.6,
+    set_name_size=4,
+    text_size=5,
+    show_percentage=FALSE
+  ) +
+    ggtitle(title) +
+    theme(
+      plot.title=element_text(
+        face="bold",
+        hjust=0.5,
+        size=12
+      ),
+      panel.background=element_rect(
+        fill="white",
+        color=NA
+      )
+    )
+}
+venn_fib <- make_venn(
+  list(
+    "Discovery\nFibrosis"=
+      disc_fib_sig,
+    "GSE135251\nFibrosis"=
+      val_fib_sig
+  ),
+  "Fibrosis DEG Overlap (FDR ≤ 0.05)",
+  c(
+    "#b2182b",
+    "#4393c3"
+  )
+)
+venn_steat <- make_venn(
+  list(
+    "Discovery\nSteatosis"=
+      disc_steat_sig,
+    "GSE135251\nNAS score"=
+      val_nas_sig
+  ),
+  "Steatosis vs NAS Overlap (FDR ≤ 0.05)",
+  c(
+    "#f4a582",
+    "#4393c3"
+  )
+)
+venn_infl <- make_venn(
+  list(
+    "Discovery\nInflammation"=
+      disc_infl_sig,
+    "GSE135251\nNAS score"=
+      val_nas_sig
+  ),
+  "Inflammation vs NAS Overlap (FDR ≤ 0.05)",
+  c(
+    "#92c5de",
+    "#4393c3"
+  )
+)
+panel_B <- plot_grid(
+  venn_fib,
+  venn_steat,
+  venn_infl,
+  ncol=3
+)
+# ============================================================
+# 22. PANEL C — DIRECTIONAL REPLICATION
+# ============================================================
+get_stats <- function(
+  res_disc,
+  res_val,
+  fdr=FDR_DESEQ
+){
+  disc <- subset(
+    res_disc,
+    !is.na(padj) &
+      padj<=fdr
+  )
+  val <- subset(
+    res_val,
+    !is.na(padj) &
+      padj<=fdr
+  )
+  overlap <- intersect(
+    rownames(disc),
+    rownames(val)
+  )
+  if(length(overlap)<2){
+    return(
+      data.frame(
+        rho=NA,
+        p=NA,
+        pct_concordant=NA,
+        n=length(overlap),
+        binom_p=NA
+      )
+    )
+  }
+  x <- res_disc[
+    overlap,
+    "log2FoldChange"
+  ]
+  y <- res_val[
+    overlap,
+    "log2FoldChange"
+  ]
+  ok <- complete.cases(x,y)
+  x <- x[ok]
+  y <- y[ok]
+  rho <- cor.test(
+    x,
+    y,
+    method="spearman"
+  )
+  same <- sign(x)==sign(y)
+  binom <- binom.test(
+    sum(same),
+    length(same),
+    p=0.5,
+    alternative="greater"
+  )
+  data.frame(
+    rho=unname(rho$estimate),
+    p=rho$p.value,
+    pct_concordant=
+      mean(same)*100,
+    n=length(same),
+    binom_p=binom$p.value
+  )
+}
+stats_fib <- get_stats(
+  resLFC_fibrosis,
+  res_fib_ext_ens
+)
+stats_steat <- get_stats(
+  resLFC_steatosis,
+  res_nas_ext_ens
+)
+stats_infl <- get_stats(
+  resLFC_inflammation,
+  res_nas_ext_ens
+)
+summary_df <- bind_rows(
+  cbind(
+    Trait="Fibrosis vs Fibrosis",
+    stats_fib
+  ),
+  cbind(
+    Trait="Steatosis vs NAS",
+    stats_steat
+  ),
+  cbind(
+    Trait="Inflammation vs NAS",
+    stats_infl
+  )
+) %>%
+  mutate(
+    Trait=factor(
+      Trait,
+      levels=rev(c(
+        "Fibrosis vs Fibrosis",
+        "Steatosis vs NAS",
+        "Inflammation vs NAS"
+      ))
+    ),
+    Significant=ifelse(
+      !is.na(binom_p) &
+        binom_p<0.05,
+      "Significant replication",
+      "Not significant"
+    ),
+    Label=paste0(
+      "n=",
+      n,
+      "  \u03c1=",
+      round(
+        rho,
+        2
+      )
+    )
+  )
+panel_C <- ggplot(
+  summary_df,
+  aes(
+    x=pct_concordant,
+    y=Trait
+  )
+) +
+  geom_vline(
+    xintercept=50,
+    linetype="dashed",
+    color="grey40",
+    linewidth=0.8
+  ) +
+  geom_segment(
+    aes(
+      x=50,
+      xend=pct_concordant,
+      y=Trait,
+      yend=Trait,
+      color=Significant
+    ),
+    linewidth=2.2,
+    alpha=0.5
+  ) +
+  geom_point(
+    aes(
+      size=n,
+      color=Significant
+    )
+  ) +
+  geom_text(
+    aes(label=Label),
+    vjust=-1.3,
+    size=3.6,
+    fontface="bold"
+  ) +
+  scale_color_manual(
+    values=c(
+      "Significant replication"=
+        "#b2182b",
+      "Not significant"=
+        "grey60"
+    )
+  ) +
+  scale_size_continuous(
+    range=c(4,9),
+    guide="none"
+  ) +
+  xlim(
+    30,
+    100
+  ) +
+  labs(
+    title="Directional Replication Summary",
+    subtitle=paste0(
+      "Sex-adjusted external models | DESeq2 FDR <= ",
+      FDR_DESEQ
+    ),
+    x="% Same-Direction Genes",
+    y=NULL,
+    color=NULL
+  ) +
+  theme_pub +
+  theme(
+    legend.position="bottom",
+    axis.text.y=element_text(
+      face="bold",
+      size=12
+    )
+  )
+# ============================================================
+# 23. PANEL D — REPLICATED FIBROSIS KEGG
+# ============================================================
+build_kegg_compare_df <- function(
+  disc_kegg,
+  ext_kegg,
+  direction_label
+){
+  if(
+    is.null(disc_kegg) ||
+    is.null(ext_kegg)
+  )
+    return(NULL)
+  if(
+    nrow(disc_kegg@result)==0 ||
+    nrow(ext_kegg@result)==0
+  )
+    return(NULL)
+  shared <- intersect(
+    disc_kegg@result$ID,
+    ext_kegg@result$ID
+  )
+  if(length(shared)==0)
+    return(NULL)
+  d <- disc_kegg@result %>%
+    filter(
+      ID %in% shared
+    ) %>%
+    transmute(
+      ID,
+      Description,
+      Cohort="Discovery",
+      p.adjust,
+      Count
+    )
+  v <- ext_kegg@result %>%
+    filter(
+      ID %in% shared
+    ) %>%
+    transmute(
+      ID,
+      Description,
+      Cohort="GSE135251",
+      p.adjust,
+      Count
+    )
+  bind_rows(
+    d,
+    v
+  ) %>%
+    mutate(
+      Direction=direction_label
+    )
+}
+kegg_compare_up <- build_kegg_compare_df(
+  ekegg_up_fibrosis,
+  ext_kegg_fib_up,
+  "Up"
+)
+kegg_compare_down <- build_kegg_compare_df(
+  ekegg_down_fibrosis,
+  ext_kegg_fib_down,
+  "Down"
+)
+kegg_compare_all <- bind_rows(
+  kegg_compare_up,
+  kegg_compare_down
+)
+if(
+  nrow(kegg_compare_all)>0
+){
+  kegg_compare_all <- kegg_compare_all %>%
+    group_by(ID) %>%
+    filter(
+      all(Count>=MIN_COUNT)
+    ) %>%
+    ungroup()
+}
+get_kegg_category <- function(
+  pathway_id
+){
+  info <- tryCatch(
+    keggGet(pathway_id)[[1]],
+    error=function(e) NULL
+  )
+  if(!is.null(info$CLASS))
+    info$CLASS[1]
+  else
+    NA
+}
+if(
+  nrow(kegg_compare_all)>0
+){
+  unique_ids <- unique(
+    kegg_compare_all$ID
+  )
+  categories <- sapply(
+    unique_ids,
+    get_kegg_category
+  )
+  category_df <- data.frame(
+    ID=unique_ids,
+    Category=categories,
+    stringsAsFactors=FALSE
+  ) %>%
+    mutate(
+      Main_Category=
+        sapply(
+          strsplit(
+            Category,
+            ";"
+          ),
+          `[`,
+          1
+        ),
+      Sub_Category=
+        sapply(
+          strsplit(
+            Category,
+            ";"
+          ),
+          `[`,
+          2
+        )
+    )
+  kegg_compare_all <- kegg_compare_all %>%
+    left_join(
+      category_df[
+        ,
+        c(
+          "ID",
+          "Main_Category"
+        )
+      ],
+      by="ID"
+    ) %>%
+    mutate(
+      Main_Category=ifelse(
+        is.na(Main_Category),
+        "Unclassified",
+        Main_Category
+      )
+    )
+}
+if(
+  nrow(kegg_compare_all)>0
+){
+  kegg_compare_all <- kegg_compare_all %>%
+    mutate(
+      neglog10p=-log10(
+        p.adjust
+      ),
+      Description=factor(
+        Description,
+        levels=rev(
+          unique(Description)
+        )
+      ),
+      Direction=factor(
+        Direction,
+        levels=c(
+          "Up",
+          "Down"
+        )
+      )
+    )
+  panel_D <- ggplot(
+    kegg_compare_all,
+    aes(
+      x=Cohort,
+      y=Description,
+      size=neglog10p,
+      color=Direction
+    )
+  ) +
+    geom_point(
+      alpha=0.85
+    ) +
+    facet_grid(
+      Main_Category~.,
+      scales="free_y",
+      space="free_y"
+    ) +
+    scale_color_manual(
+      values=c(
+        "Up"="#ffa500ff",
+        "Down"="#4575B4"
+      )
+    ) +
+    scale_size_continuous(
+      range=c(3,9),
+      name="-log10(FDR)"
+    ) +
+    labs(
+      title="Replicated KEGG Pathways (Fibrosis)",
+      subtitle=paste0(
+        "Significant in BOTH cohorts | KEGG q-value < ",
+        FDR_PATH,
+        " | Count >= ",
+        MIN_COUNT
+      ),
+      x=NULL,
+      y=NULL,
+      color="Direction"
+    ) +
+    theme_pub +
+    theme(
+      axis.text.y=element_text(
+        size=10
+      ),
+      strip.text.y=element_text(
+        angle=0,
+        size=11,
+        face="bold"
+      ),
+      legend.position="bottom",
+      panel.grid.major=element_blank(),
+      panel.grid.minor=element_blank()
+    )
+} else {
+  panel_D <- ggplot() +
+    annotate(
+      "text",
+      x=0.5,
+      y=0.5,
+      label="No overlapping KEGG pathways",
+      size=5,
+      fontface="italic"
+    ) +
+    theme_void() +
+    ggtitle(
+      "Replicated KEGG Pathways (Fibrosis)"
+    ) +
+    theme(
+      plot.title=element_text(
+        face="bold",
+        hjust=0.5,
+        size=14
+      )
+    )
+}
+# ============================================================
+# 24. FINAL A-D FIGURE
+# ============================================================
+bottom_row <- plot_grid(
+  panel_C,
+  panel_D,
+  ncol=2,
+  rel_widths=c(
+    1,
+    1.3
+  ),
+  labels=c(
+    "C",
+    "D"
+  ),
+  label_size=18
+)
+final_validation_figure <- plot_grid(
+  panel_A,
+  panel_B,
+  bottom_row,
+  ncol=1,
+  rel_heights=c(
+    1.3,
+    0.9,
+    1.1
+  ),
+  labels=c(
+    "A",
+    "B",
+    ""
+  ),
+  label_size=18
+)
+# ---- after running the GSE135251 (sex-adjusted) chunk ----
+val_GSE135251_sexadj <- list(
+  label         = "GSE135251 (Sex-adj)",
+  fib_res       = as.data.frame(res_fib_ext_ens),
+  nas_res       = as.data.frame(res_nas_ext_ens),
+  kegg_fib_up   = ext_kegg_fib_up,
+  kegg_fib_down = ext_kegg_fib_down,
+  kegg_nas_up   = ext_kegg_nas_up,
+  kegg_nas_down = ext_kegg_nas_down
+)
+all_cohorts <- list(val_GSE162694, val_GSE135251_unadj, val_GSE135251_sexadj)
+cohort_levels <- sapply(all_cohorts, `[[`, "label")
+```
+
+```{r external-05}
+## =====================================================================
+## FIGURE 3 + TABLES S5-S7: external transcriptomic validation (full run)
+##
+## Needs in the session:
+##   dds   DESeqDataSet, raw counts, 208 samples,
+##         colData = phenotype_subset
+##   val_GSE162694, val_GSE135251_unadj, val_GSE135251_sexadj
+##         (lists made at the end of each external-cohort chunk)
+## =====================================================================
+suppressPackageStartupMessages({
+  library(DESeq2); library(apeglm); library(org.Hs.eg.db); library(AnnotationDbi)
+  library(clusterProfiler)
+})
+stopifnot("run the external-cohort chunks first" =
+            all(sapply(c("val_GSE162694", "val_GSE135251_unadj", "val_GSE135251_sexadj"), exists)))
+## ---------------------------------------------------------------------
+## A. Discovery DESeq2 = Table S1 / Fig. 1
+##    genes >= 10 counts in >= 10 samples (21,114); ~ Age + BMI + Sex + trait;
+##    results(alpha = 0.05); apeglm
+## ---------------------------------------------------------------------
+raw <- counts(dds)
+cd  <- as.data.frame(colData(dds))
+num  <- function(x) suppressWarnings(as.numeric(as.character(x)))
+pick <- function(pat) { v <- grep(pat, names(cd), ignore.case = TRUE, value = TRUE)
+  if (!length(v)) stop("no column matching ", pat); v[1] }
+sx <- tolower(trimws(as.character(cd[[pick("gender|^sex")]])))
+cd$Sex <- factor(ifelse(sx %in% c("female", "f", "1", "woman"), "Female",
+                 ifelse(sx %in% c("male", "m", "0", "man"), "Male", NA)), c("Female", "Male"))
+cd$Age_z <- as.numeric(scale(num(cd[[pick("^age")]])))
+cd$BMI_z <- as.numeric(scale(num(cd[[pick("^bmi")]])))
+for (tr in c("Steatosis", "Inflammation", "Fibrosis"))
+  cd[[tr]] <- factor(ifelse(num(cd[[pick(paste0("^", tr, "($|_kleiner)"))]]) >= 1, "Yes", "No"), c("No", "Yes"))
+stopifnot("sex must be 153 F / 55 M" = identical(as.vector(table(cd$Sex)), c(153L, 55L)))
+KEEP <- rowSums(raw >= 10) >= 10
+stopifnot(sum(KEEP) == 21114)
+ALPHA <- FDR_GENE
+run_deg <- function(tr) {
+  ok <- complete.cases(cd[, c("Age_z", "BMI_z", "Sex", tr)])
+  d  <- DESeq(DESeqDataSetFromMatrix(raw[KEEP, ok], cd[ok, ],
+              as.formula(paste("~ Age_z + BMI_z + Sex +", tr))), quiet = TRUE)
+  cf  <- paste0(tr, "_Yes_vs_No")
+  res <- results(d, name = cf, alpha = ALPHA)
+  r <- as.data.frame(lfcShrink(d, coef = cf, res = res, type = "apeglm", quiet = TRUE))
+  rownames(r) <- sub("\\..*$", "", rownames(r))
+  r$Gene <- unname(mapIds(org.Hs.eg.db, rownames(r), "SYMBOL", "ENSEMBL", multiVals = "first"))
+  r
+}
+fig2_res <- setNames(lapply(c("Steatosis", "Inflammation", "Fibrosis"), run_deg),
+                     c("Steatosis", "Inflammation", "Fibrosis"))
+print(sapply(fig2_res, function(r) c(tested = sum(!is.na(r$padj)), DEGs = sum(r$padj <= FDR_GENE, na.rm = TRUE))))
+## expect tested 17839 / 19067 / 21114 ; DEGs 1532 / 1852 / 93
+## ---------------------------------------------------------------------
+## B. Discovery KEGG, fibrosis (Table S7), background = tested genes
+## ---------------------------------------------------------------------
+to_entrez <- function(ens) unique(na.omit(unname(
+  mapIds(org.Hs.eg.db, ens, "ENTREZID", "ENSEMBL", multiVals = "first"))))
+fibr <- fig2_res$Fibrosis
+universe <- to_entrez(rownames(fibr)[!is.na(fibr$padj)])
+cat("KEGG background:", length(universe), "Entrez IDs\n")
+kegg_fun <- function(ens) {
+  g <- to_entrez(ens); if (length(g) < 3) return(NULL)
+  k <- enrichKEGG(g, organism = "hsa", universe = universe,
+                  pvalueCutoff = 1, qvalueCutoff = 1, pAdjustMethod = "BH")
+  if (!is.null(k)) k@result <- k@result[k@result$p.adjust <= FDR_KEGG & k@result$Count >= 3, ]
+  k
+}
+sigf <- !is.na(fibr$padj) & fibr$padj <= FDR_GENE
+ekegg_up_fibrosis   <- kegg_fun(rownames(fibr)[sigf & fibr$log2FoldChange > 0])
+ekegg_down_fibrosis <- kegg_fun(rownames(fibr)[sigf & fibr$log2FoldChange < 0])
+print(rbind(ekegg_up_fibrosis@result[, c("Description", "p.adjust", "Count")],
+            ekegg_down_fibrosis@result[, c("Description", "p.adjust", "Count")]))
+## expect 7 (Table S7): Tryptophan metabolism (down); Bladder cancer, Hepatitis C,
+## Influenza A, MicroRNAs in cancer, Epstein-Barr virus infection, Estrogen signaling (up)
+## ---------------------------------------------------------------------
+## C. Validation, Figure 3, Tables S7-S9
+## ---------------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(ggvenn)
+  library(cowplot); library(openxlsx)
+})
+OUTV <- "Fig3_validation"; dir.create(OUTV, showWarnings = FALSE)
+fv <- function(x) file.path(OUTV, x)
+FDR_G     <- FDR_GENE # gene level, discovery AND external
+FDR_K     <- FDR_KEGG # KEGG
+MIN_COUNT <- 3
+TR        <- c("Fibrosis", "Steatosis", "Inflammation")
+COL_UP    <- "#ffa500ff"; COL_DOWN <- "#4575B4"
+COHORT_COL <- c(GSE162694 = "#DE2D26", GSE135251 = "#31A354")
+## ---------------------------------------------------------------------
+## 0. Inputs and checks
+## ---------------------------------------------------------------------
+stopifnot("fig2_res missing - rebuild it from the Fig. 2 chunk" = exists("fig2_res"),
+          all(TR %in% names(fig2_res)))
+disc <- lapply(fig2_res[TR], as.data.frame)
+n_disc <- sapply(disc, function(r) sum(r$padj <= FDR_G, na.rm = TRUE))
+print(n_disc)
+stopifnot("discovery does not match Table S3 (93/1532/1852)" =
+            all(n_disc == c(Fibrosis = 93, Steatosis = 1532, Inflammation = 1852)))
+symtab <- bind_rows(lapply(disc, function(r) data.frame(ens = rownames(r), sym = r$Gene))) %>%
+  distinct(ens, .keep_all = TRUE)
+sym_of <- function(ens) {
+  s <- symtab$sym[match(ens, symtab$ens)]
+  ifelse(is.na(s) | s == "", ens, s)
+}
+main <- list(GSE162694 = val_GSE162694, GSE135251 = val_GSE135251_unadj)
+sens <- list(`GSE135251 (sex-adjusted)` = val_GSE135251_sexadj)
+field <- c(Fibrosis = "fib_res", Steatosis = "nas_res", Inflammation = "nas_res")
+## ---------------------------------------------------------------------
+## 1. Gene-level replication
+## ---------------------------------------------------------------------
+compare_one <- function(d, e, trait, cohort) {
+  e <- as.data.frame(e)
+  common <- intersect(rownames(d)[!is.na(d$padj)], rownames(e)[!is.na(e$padj)])
+  ds <- rownames(d)[!is.na(d$padj) & d$padj <= FDR_G]
+  es <- rownames(e)[!is.na(e$padj) & e$padj <= FDR_G]
+  sh <- intersect(ds, es)
+  x <- d[sh, "log2FoldChange"]; y <- e[sh, "log2FoldChange"]
+  same <- sign(x) == sign(y)
+  gw <- sign(d[common, "log2FoldChange"]) == sign(e[common, "log2FoldChange"])
+  summ <- data.frame(
+    Cohort = cohort, Trait = trait,
+    External_phenotype = if (trait == "Fibrosis") "Fibrosis F0 vs F1-F4" else "NAS (continuous)",
+    Discovery_DEGs = length(ds),
+    Discovery_DEGs_measured_externally = length(intersect(ds, common)),
+    External_DEGs = length(es),
+    Shared_DEGs = length(sh),
+    Replication_pct = round(100 * length(sh) / length(ds), 1),
+    Same_direction = sum(same),
+    Same_direction_pct = round(100 * mean(same), 1),
+    Binomial_p = signif(binom.test(sum(same), length(sh), 0.5)$p.value, 3),
+    Spearman_rho_shared = round(cor(x, y, method = "spearman"), 3),
+    Genes_in_common = length(common),
+    Spearman_rho_genomewide = round(cor(d[common, "log2FoldChange"], e[common, "log2FoldChange"],
+                                        method = "spearman"), 3),
+    Same_direction_genomewide_pct = round(100 * mean(gw), 1),
+    Discordant_genes = paste(sym_of(sh[!same]), collapse = "; "),
+    stringsAsFactors = FALSE)
+  genes <- data.frame(Cohort = cohort, Trait = trait, Ensembl = sh, Symbol = sym_of(sh),
+                      Discovery_log2FC = x, Discovery_FDR = d[sh, "padj"],
+                      External_log2FC = y, External_FDR = e[sh, "padj"],
+                      Concordant = same, stringsAsFactors = FALSE) %>%
+    arrange(Trait, Discovery_FDR)
+  scatter <- data.frame(Cohort = cohort, Trait = trait, ens = common,
+                        disc = d[common, "log2FoldChange"], ext = e[common, "log2FoldChange"],
+                        dsig = common %in% ds, esig = common %in% es) %>%
+    mutate(Status = case_when(dsig & esig & sign(disc) == sign(ext) ~ "Replicated (concordant)",
+                              dsig & esig ~ "Discordant direction",
+                              dsig ~ "Discovery-only",
+                              esig ~ "Validation-only",
+                              TRUE ~ "Not significant"))
+  list(summ = summ, genes = genes, scatter = scatter, ds = ds, es = es)
+}
+run_set <- function(cset) {
+  out <- list()
+  for (cn in names(cset)) for (t in TR)
+    out[[paste(cn, t)]] <- compare_one(disc[[t]], cset[[cn]][[field[[t]]]], t, cn)
+  out
+}
+cmp_main <- run_set(main)
+cmp_sens <- run_set(sens)
+S12A <- bind_rows(lapply(cmp_main, `[[`, "summ"))
+S12B <- bind_rows(lapply(cmp_main, `[[`, "genes"))
+S13A <- bind_rows(lapply(cmp_sens, `[[`, "summ"))
+S13B <- bind_rows(lapply(cmp_sens, `[[`, "genes"))
+print(S12A[, c("Cohort", "Trait", "Discovery_DEGs", "Shared_DEGs", "Replication_pct",
+               "Same_direction_pct", "Spearman_rho_shared", "Spearman_rho_genomewide",
+               "Same_direction_genomewide_pct")], row.names = FALSE)
+print(S13A[, c("Cohort", "Trait", "Shared_DEGs", "Same_direction_pct", "Spearman_rho_shared",
+               "Discordant_genes")], row.names = FALSE)
+## ---------------------------------------------------------------------
+## 2. KEGG replication (fibrosis): significant in discovery AND external
+## ---------------------------------------------------------------------
+fib <- disc$Fibrosis
+up_f   <- rownames(fib)[!is.na(fib$padj) & fib$padj <= FDR_G & fib$log2FoldChange > 0]
+down_f <- rownames(fib)[!is.na(fib$padj) & fib$padj <= FDR_G & fib$log2FoldChange < 0]
+stopifnot(exists("ekegg_up_fibrosis"), exists("ekegg_down_fibrosis"))
+sig_tab <- function(k) {
+  if (is.null(k) || !nrow(k@result)) return(data.frame(ID = character(), p.adjust = numeric(), Count = integer()))
+  k@result %>% filter(p.adjust <= FDR_K, Count >= MIN_COUNT) %>% dplyr::select(ID, p.adjust, Count)
+}
+all_cohorts <- c(main, sens)
+S14 <- bind_rows(lapply(c("Up", "Down"), function(dir) {
+  dk <- if (dir == "Up") ekegg_up_fibrosis else ekegg_down_fibrosis
+  if (is.null(dk) || !nrow(dk@result)) return(NULL)
+  base <- dk@result %>% filter(p.adjust <= FDR_K, Count >= MIN_COUNT) %>%
+    transmute(Direction = dir, ID, Description,
+              Category = if ("category" %in% names(dk@result)) category else NA_character_,
+              Discovery_FDR = p.adjust, Discovery_genes = Count)
+  for (cn in names(all_cohorts)) {
+    ek <- if (dir == "Up") all_cohorts[[cn]]$kegg_fib_up else all_cohorts[[cn]]$kegg_fib_down
+    er <- if (is.null(ek) || !nrow(ek@result)) data.frame(ID = character(), p.adjust = numeric(), Count = integer())
+          else ek@result %>% dplyr::select(ID, p.adjust, Count)
+    base <- left_join(base, er, by = "ID")
+    names(base)[names(base) == "p.adjust"] <- paste0(cn, "_FDR")
+    names(base)[names(base) == "Count"]    <- paste0(cn, "_genes")
+    base[[paste0(cn, "_significant")]] <- base$ID %in% sig_tab(ek)$ID
+  }
+  base
+}))
+S14$Replicated_in <- apply(S14[, paste0(names(main), "_significant")], 1,
+                           function(v) paste(names(main)[v], collapse = " + "))
+S14$Replicated_in[S14$Replicated_in == ""] <- "none"
+S14 <- S14 %>% arrange(Direction, desc(nchar(Replicated_in)), Discovery_FDR)
+## KEGG category for rows lacking one
+need <- is.na(S14$Category) | S14$Category == ""
+if (any(need) && requireNamespace("KEGGREST", quietly = TRUE)) {
+  S14$Category[need] <- sapply(S14$ID[need], function(id) {
+    cl <- tryCatch(KEGGREST::keggGet(id)[[1]]$CLASS, error = function(e) NULL)
+    if (length(cl)) trimws(strsplit(cl[1], ";")[[1]][1]) else NA_character_
+  })
+}
+S14$Category[S14$ID == "hsa04820"] <- "Cellular Processes"
+S14$Category[is.na(S14$Category)] <- "Other"
+print(S14 %>% dplyr::select(Direction, Description, Discovery_FDR, Replicated_in), row.names = FALSE)
+## ---------------------------------------------------------------------
+## 3. Figure 6
+## ---------------------------------------------------------------------
+## ---- Nature Metabolism text sizes ------------------------------------
+## Canvas is 17 x 21 in; the journal prints a double-column figure at 183 mm
+## (7.2 in), so everything is shrunk by 7.2/17. K converts the size we want
+## AT PRINT (5-7 pt; panel letters 8 pt bold) into the size to use here.
+FIG_W <- 17; FIG_H <- 21
+K   <- FIG_W / (183 / 25.4)            # ~2.36
+pt  <- function(x) x * K               # theme text (pt)
+mm  <- function(x) x * K / .pt         # geom_text / geom_label size (mm)
+FONT <- "Helvetica"                    # "Arial" on Windows
+theme_pub <- theme_bw(base_size = pt(6), base_family = FONT) +
+  theme(plot.title = element_text(face = "bold", size = pt(7), hjust = 0.5),
+        plot.subtitle = element_text(size = pt(6), hjust = 0.5, colour = "grey30"),
+        axis.title = element_text(face = "bold", size = pt(6.5)),
+        axis.text = element_text(colour = "black", size = pt(6)),
+        legend.title = element_text(face = "bold", size = pt(6.5)),
+        legend.text = element_text(size = pt(6)),
+        legend.key.size = unit(pt(3), "mm"),
+        panel.grid.minor = element_blank(),
+        strip.background = element_rect(fill = "grey85"),
+        strip.text = element_text(face = "bold", size = pt(6.5)))
+## ---- a: log2FC concordance, 3 traits x 2 cohorts ---------------------
+sc <- bind_rows(lapply(cmp_main, `[[`, "scatter")) %>%
+  mutate(Trait = factor(Trait, levels = TR), Cohort = factor(Cohort, levels = names(main)),
+         Status = factor(Status, levels = c("Not significant", "Validation-only", "Discovery-only",
+                                            "Discordant direction", "Replicated (concordant)"))) %>%
+  arrange(Status)
+lab_a <- S12A %>%
+  mutate(Trait = factor(Trait, levels = TR), Cohort = factor(Cohort, levels = names(main)),
+         label = sprintf("Genome-wide: ρ = %.2f, %.1f%% same direction (n = %s)\nShared DEGs: ρ = %.2f, %.1f%% same direction (n = %d)",
+                         Spearman_rho_genomewide, Same_direction_genomewide_pct,
+                         format(Genes_in_common, big.mark = ","),
+                         Spearman_rho_shared, Same_direction_pct, Shared_DEGs))
+status_col <- c("Not significant" = "grey85", "Validation-only" = "#F4A582",
+                "Discovery-only" = "#4393C3", "Discordant direction" = "grey40",
+                "Replicated (concordant)" = "#B2182B")
+panel_a <- ggplot(sc, aes(disc, ext)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(aes(colour = Status), size = 2, alpha = 0.7) +
+  geom_smooth(data = subset(sc, Status %in% c("Replicated (concordant)", "Discordant direction")),
+              method = "lm", se = FALSE, colour = "#B2182B", linewidth = 0.8) +
+  geom_label(data = lab_a, aes(x = -Inf, y = Inf, label = label), hjust = -0.02, vjust = 1.1,
+             size = mm(5.5), label.size = 0.3, family = FONT, inherit.aes = FALSE) +
+  facet_grid(Trait ~ Cohort, scales = "free") +
+  scale_colour_manual(values = status_col, name = "Gene status") +
+  labs(x = expression(bold(log[2]*FC~"—"~discovery)),
+       y = expression(bold(log[2]*FC~"—"~external)),
+       title = "Signature replication in external cohorts") +
+  theme_pub + theme(legend.position = "bottom") +
+  guides(colour = guide_legend(override.aes = list(size = 5, alpha = 1)))
+## ---- b: Venn diagrams ------------------------------------------------
+venn_one <- function(t, ttl) {
+  lst <- list(cmp_main[[paste("GSE162694", t)]]$ds,
+              cmp_main[[paste("GSE162694", t)]]$es,
+              cmp_main[[paste("GSE135251", t)]]$es)
+  names(lst) <- c(paste("Discovery", tolower(t)), "GSE162694", "GSE135251")
+  ggvenn(lst, fill_color = c("#6BAED6", "#DE2D26", "#31A354"), fill_alpha = 0.45,
+         stroke_size = 0.5, set_name_size = mm(6.5), text_size = mm(6.5), show_percentage = FALSE) +
+    ggtitle(ttl) + theme(plot.title = element_text(hjust = 0.5, face = "bold", size = pt(7), family = FONT))
+}
+panel_b <- plot_grid(venn_one("Fibrosis", "Fibrosis"),
+                     venn_one("Steatosis", "Steatosis (discovery) vs NAS (external)"),
+                     venn_one("Inflammation", "Inflammation (discovery) vs NAS (external)"),
+                     nrow = 1)
+## ---- c: concordance among shared DEGs --------------------------------
+## Replaces the whole "c" block in the Figure 3 script (from "## ---- c:" up to
+## the line before "## ---- d:"). Changes:
+##   1. Cohort colours are named, so red is always GSE162694 and green is always
+##      GSE135251 (the same red/green as the cohort circles in the Venn diagrams, b).
+##   2. The colour key is now actually drawn. cowplot::get_legend() returns an
+##      empty box with ggplot2 >= 3.5 when the legend sits at the bottom, which
+##      is why the key was missing; pick_legend() takes the non-empty one.
+COHORT_COL <- c(GSE162694 = "#DE2D26", GSE135251 = "#31A354")
+cdat <- S12A %>% mutate(Trait = factor(Trait, levels = rev(TR)),
+                        Cohort = factor(Cohort, levels = names(main)))
+panel_c1 <- ggplot(cdat, aes(Same_direction_pct, Trait, fill = Cohort)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_vline(xintercept = 50, linetype = "dashed", colour = "grey40") +
+  geom_text(aes(label = sprintf("%.1f%%\nn = %d", Same_direction_pct, Shared_DEGs)),
+            position = position_dodge(0.8), hjust = -0.1, size = mm(6), lineheight = 0.85, family = FONT) +
+  scale_fill_manual(values = COHORT_COL, breaks = names(COHORT_COL), name = NULL) +
+  scale_x_continuous(limits = c(0, 145), breaks = seq(0, 100, 25)) +
+  labs(x = "% same direction", y = NULL, title = "Directional concordance") +
+  theme_pub + theme(legend.position = "bottom", legend.direction = "horizontal",
+                    legend.text = element_text(size = pt(6.5)))
+panel_c2 <- ggplot(cdat, aes(Spearman_rho_shared, Trait, fill = Cohort)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", Spearman_rho_shared)),
+            position = position_dodge(0.8), hjust = -0.15, size = mm(6), family = FONT) +
+  scale_fill_manual(values = COHORT_COL, breaks = names(COHORT_COL), name = NULL) +
+  scale_x_continuous(limits = c(0, 1.2), breaks = seq(0, 1, 0.5)) +
+  labs(x = expression(bold("Spearman "*rho*" of "*log[2]*FC)), y = NULL, title = "Effect-size correlation") +
+  theme_pub + theme(legend.position = "bottom", axis.text.y = element_blank())
+pick_legend <- function(p) {                      # works with ggplot2 < 3.5 and >= 3.5
+  g <- ggplot2::ggplotGrob(p)
+  boxes <- g$grobs[grepl("^guide-box", g$layout$name)]
+  boxes[!vapply(boxes, inherits, logical(1), "zeroGrob")][[1]]
+}
+leg_c   <- pick_legend(panel_c1)
+panel_c <- plot_grid(plot_grid(panel_c1 + theme(legend.position = "none"),
+                               panel_c2 + theme(legend.position = "none"),
+                               nrow = 1, rel_widths = c(1.2, 1)),
+                     leg_c, ncol = 1, rel_heights = c(1, 0.08))
+## ---- d: replicated fibrosis KEGG pathways ----------------------------
+rep_ids <- S14$ID[S14$Replicated_in != "none"]
+ddat <- bind_rows(
+  S14 %>% filter(ID %in% rep_ids) %>%
+    transmute(ID, Description, Category, Direction, Cohort = "Discovery", FDR = Discovery_FDR),
+  bind_rows(lapply(names(main), function(cn) S14 %>%
+    filter(ID %in% rep_ids, .data[[paste0(cn, "_significant")]]) %>%
+    transmute(ID, Description, Category, Direction, Cohort = cn, FDR = .data[[paste0(cn, "_FDR")]])))
+) %>%
+  mutate(Cohort = factor(Cohort, levels = c("Discovery", names(main))),
+         Direction = factor(Direction, levels = c("Up", "Down")),
+         Description = factor(Description, levels = rev(unique(Description[order(Category, Direction)]))))
+stopifnot("a plotted KEGG point is not significant" = all(ddat$FDR <= FDR_K))
+panel_d <- if (nrow(ddat)) {
+  ggplot(ddat, aes(Cohort, Description, size = -log10(FDR), colour = Direction)) +
+    geom_point(alpha = 0.9) +
+    guides(colour = guide_legend(override.aes = list(size = 5), order = 1)) +
+    facet_grid(Category ~ ., scales = "free_y", space = "free_y",
+               labeller = labeller(Category = label_wrap_gen(12))) +
+    scale_y_discrete(labels = function(x) stringr::str_wrap(x, 32)) +
+    scale_x_discrete(labels = c(Discovery = "Discovery", GSE162694 = "GSE\n162694", GSE135251 = "GSE\n135251")) +
+    scale_colour_manual(values = c(Up = COL_UP, Down = COL_DOWN)) +
+    scale_size_continuous(range = c(4, 11), name = expression(-log[10]*"(FDR)")) +
+    labs(x = NULL, y = NULL, title = "Replicated KEGG pathways (fibrosis)",
+         subtitle = sprintf("FDR ≤ %.2f, ≥ 3 genes; discovery and ≥ 1\nexternal cohort", FDR_K, MIN_COUNT)) +
+    theme_pub + theme(strip.text.y = element_text(angle = 0, size = pt(5.5), hjust = 0),
+                      axis.text.y = element_text(size = pt(6), lineheight = 0.85),
+                      axis.text.x = element_text(size = pt(6), lineheight = 0.85),
+                      legend.box = "vertical", legend.spacing.y = unit(0, "mm"),
+                      legend.position = "bottom", panel.grid = element_blank())
+} else ggplot() + annotate("text", 0.5, 0.5, label = "No replicated KEGG pathways", size = mm(7)) + theme_void()
+fig3 <- plot_grid(
+  panel_a,
+  panel_b,
+  plot_grid(panel_c, panel_d, nrow = 1, rel_widths = c(1, 1.15), labels = c("c", "d"), label_size = pt(8), label_fontfamily = FONT),
+  ncol = 1, rel_heights = c(1.65, 0.9, 1.1), labels = c("a", "b", ""), label_size = pt(8), label_fontfamily = FONT) +
+  theme(plot.background = element_rect(fill = "white", colour = NA))
+ggsave(fv("Fig3_validation.png"),  fig3, width = FIG_W, height = FIG_H, dpi = 400, bg = "white")
+ggsave(fv("Fig3_validation.pdf"),  fig3, width = FIG_W, height = FIG_H, bg = "white",
+       device = if (capabilities("cairo")) cairo_pdf else "pdf")
+ggsave(fv("Fig3_validation.tiff"), fig3, width = FIG_W, height = FIG_H, dpi = 300, compression = "lzw", bg = "white")
+## ---------------------------------------------------------------------
+## 4. Tables S12-S14
+## ---------------------------------------------------------------------
+wb <- createWorkbook()
+add <- function(name, df) { addWorksheet(wb, name); writeData(wb, name, df)
+  setColWidths(wb, name, cols = seq_len(ncol(df)), widths = "auto") }
+add("S7_summary",      S12A)
+add("S8_shared_DEGs",  S12B)
+add("S7_sexadj_summary", S13A)
+add("S8_sexadj_shared_DEGs", S13B)
+add("S9_KEGG_fibrosis", S14)
+saveWorkbook(wb, fv("Tables_S5_S7_validation.xlsx"), overwrite = TRUE)
+## ---------------------------------------------------------------------
+## 5. Numbers for the manuscript
+## ---------------------------------------------------------------------
+rng <- function(v, d = 1) if (length(unique(round(v, d))) == 1) sprintf(paste0("%.", d, "f"), v[1]) else
+  sprintf(paste0("%.", d, "f–%.", d, "f"), min(v), max(v))
+by_t <- function(df, t) df[df$Trait == t, ]
+L <- c("================ EXTERNAL VALIDATION - FOR THE MANUSCRIPT ================",
+       sprintf("Discovery DEGs (FDR <= 0.05): fibrosis %d, steatosis %d, inflammation %d",
+               n_disc["Fibrosis"], n_disc["Steatosis"], n_disc["Inflammation"]))
+for (t in TR) {
+  a <- by_t(S12A, t); s <- by_t(S13A, t)
+  L <- c(L, "", toupper(t),
+    sprintf("  shared DEGs: %s (GSE162694 / GSE135251)", paste(a$Shared_DEGs, collapse = " / ")),
+    sprintf("  replication rate: %s%%", paste(a$Replication_pct, collapse = " / ")),
+    sprintf("  same direction: %s%% | rho shared: %s", paste(a$Same_direction_pct, collapse = " / "),
+            paste(a$Spearman_rho_shared, collapse = " / ")),
+    sprintf("  genome-wide rho: %s | same direction: %s%%", paste(a$Spearman_rho_genomewide, collapse = " / "),
+            paste(a$Same_direction_genomewide_pct, collapse = " / ")),
+    sprintf("  discordant: %s", paste(ifelse(a$Discordant_genes == "", "none", a$Discordant_genes), collapse = " | ")),
+    sprintf("  sex-adjusted GSE135251: shared %d, same direction %.1f%%, rho %.3f, discordant: %s",
+            s$Shared_DEGs, s$Same_direction_pct, s$Spearman_rho_shared,
+            ifelse(s$Discordant_genes == "", "none", s$Discordant_genes)))
+}
+nf <- S12A$Trait != "Fibrosis"
+L <- c(L, "", "RANGES",
+  sprintf("  same direction, fibrosis: %s%%; steatosis+inflammation: %s%%",
+          rng(S12A$Same_direction_pct[!nf]), rng(S12A$Same_direction_pct[nf])),
+  sprintf("  rho shared, all: %s", rng(S12A$Spearman_rho_shared, 3)),
+  sprintf("  replication: fibrosis %s%%, steatosis %s%%, inflammation %s%%",
+          rng(by_t(S12A, "Fibrosis")$Replication_pct), rng(by_t(S12A, "Steatosis")$Replication_pct),
+          rng(by_t(S12A, "Inflammation")$Replication_pct)),
+  sprintf("  genome-wide rho: %s; same direction: %s%%", rng(S12A$Spearman_rho_genomewide, 2),
+          rng(S12A$Same_direction_genomewide_pct, 0)),
+  sprintf("  sex-adjusted: same direction %s%%, rho %s", rng(S13A$Same_direction_pct),
+          rng(S13A$Spearman_rho_shared, 3)),
+  "", "KEGG (fibrosis)",
+  sprintf("  significant in discovery: %d (up %d, down %d)", nrow(S14),
+          sum(S14$Direction == "Up"), sum(S14$Direction == "Down")))
+for (r in c("GSE162694 + GSE135251", "GSE162694", "GSE135251", "none")) {
+  q <- S14[S14$Replicated_in == r, ]
+  if (nrow(q)) L <- c(L, sprintf("  %-22s %s", paste0(r, ":"),
+                                 paste(sprintf("%s (%s)", q$Description, tolower(q$Direction)), collapse = "; ")))
+}
+L <- c(L, "",
+       "==========================================================================")
+writeLines(L, fv("validation_numbers.txt"))
+cat(paste(L, collapse = "\n"), "\n")
+cat("\nWrote:", fv("validation_numbers.txt"), "and", fv("Fig3_validation.png"), "\n")
+```
+
+## Source Data Fig. 3
+
+```{r external-06, message=FALSE, warning=FALSE}
+sd3_venn <- dplyr::bind_rows(lapply(c(cmp_main, cmp_sens), function(x) {
+  u <- union(x$ds, x$es)
+  data.frame(Cohort = x$summ$Cohort, Trait = x$summ$Trait, Ensembl_ID = u,
+             Discovery_DEG = u %in% x$ds, External_DEG = u %in% x$es)
+}))
+write_source_data("Source Data Fig. 3.xlsx", list(
+  sd_panel("Fig. 3a", "Log2 fold changes in the discovery versus each external cohort for all genes measured in both (Status = significance class).", sc),
+  sd_panel("Fig. 3b", "Discovery and external DEGs (FDR <= 0.05) per cohort and feature (Venn diagram membership).", sd3_venn),
+  sd_panel("Fig. 3c", "Percentage of shared DEGs with the same direction and Spearman correlation of their log2 fold changes.", cdat),
+  sd_panel("Fig. 3d", "Replicated fibrosis KEGG pathways (FDR <= 0.10, >= 3 genes) in discovery and external cohorts.", ddat)))
+```
+
+## Tables S5, S6 and S7
+
+```{r external-07, message=FALSE, warning=FALSE}
+nm <- function(x) setNames(x, gsub("_", " ", names(x)))
+S5 <- nm(bind_rows(S12A, S13A))
+names(S5)[names(S5) == "Replication pct"] <- "Replication pct (shared and same direction, % of discovery DEGs)"
+add_table("Table S5", S5)
+add_table("Table S6", nm(bind_rows(S12B, S13B)))
+add_table("Table S7", nm(S14))
+```
+
+## Discovery lipid table (Table S3 of the Supplementary Tables workbook)
+
+```{r external-08, message=FALSE, warning=FALSE}
+# The ST000915 comparison needs the curated lipid names ('Lipid main ID', 'Lipid Class') of Table S3.
+if (!file.exists(SUPP_XLSX)) stop("Put the Supplementary Tables workbook at ", SUPP_XLSX, " (or set MASLD_SUPP_XLSX)")
+my_results <- readxl::read_excel(SUPP_XLSX, sheet = "Table S3", skip = 1)
+```
+
+#### ST000915
+
+```{r external-09}
+# ============================================================
+# ST000915 EXTERNAL LIVER LIPIDOMICS VALIDATION
+# STEATOSIS ONLY
+#
+# Internal:
+#   Table_S4.xlsx
+#   Steatosis, FDR ≤ 0.10
+#
+# External:
+#   ST000915
+#   Normal vs Steatosis/NASH/Cirrhosis
+#   Adjusted for Age + BMI + Sex
+#
+# No tables are saved.
+# Only final concordance table is printed.
+# ============================================================
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+library(readxl)
+# ============================================================
+# 2. INTERNAL TABLE S4
+# ============================================================
+table_s4 <- my_results
+required_s4 <- c(
+  "Lipid main ID",
+  "Phenotype",
+  "logFC",
+  "adj.P.Val"
+)
+if (!all(required_s4 %in% colnames(table_s4))) {
+  stop(
+    "Table S3 is missing required columns: ",
+    paste(
+      setdiff(required_s4, colnames(table_s4)),
+      collapse = ", "
+    )
+  )
+}
+# ============================================================
+# 3. INTERNAL STEATOSIS SIGNIFICANT LIPIDS
+# ============================================================
+int_steatosis <- table_s4 %>%
+  filter(
+    Phenotype == "Steatosis",
+    !is.na(`Lipid main ID`),
+    !is.na(logFC),
+    !is.na(adj.P.Val),
+    adj.P.Val <= 0.10
+  ) %>%
+  transmute(
+    Lipid = as.character(`Lipid main ID`),
+    Internal_logFC = as.numeric(logFC),
+    Internal_FDR = as.numeric(adj.P.Val),
+    Internal_Direction = ifelse(
+      Internal_logFC > 0,
+      "Up",
+      "Down"
+    )
+  ) %>%
+  distinct(
+    Lipid,
+    .keep_all = TRUE
+  )
+if (nrow(int_steatosis) == 0) {
+  stop(
+    "No significant Steatosis lipids found in Table S4."
+  )
+}
+# ============================================================
+# 4. ST000915 ANALYSIS IDs
+# ============================================================
+analysis_ids <- c(
+  "AN001485",
+  "AN001486",
+  "AN001487",
+  "AN001488",
+  "AN001489",
+  "AN001490"
+)
+# ============================================================
+# 5. DOWNLOAD ST000915 FILE
+# ============================================================
+download_mwtab <- function(analysis_id) {
+
+  url <- paste0(
+    "https://www.metabolomicsworkbench.org/data/",
+    "study_textformat_view.php?",
+    "STUDY_ID=ST000915&",
+    "ANALYSIS_ID=",
+    analysis_id,
+    "&MODE=d"
+  )
+
+  x <- readLines(
+    url,
+    warn = FALSE
+  )
+
+  if (length(x) == 0) {
+    stop(
+      "No data returned for ",
+      analysis_id
+    )
+  }
+
+  x
+}
+# ============================================================
+# 6. EXTRACT MS_METABOLITE_DATA
+# ============================================================
+get_ms_section <- function(
+    analysis_id
+) {
+
+  x <- download_mwtab(
+    analysis_id
+  )
+
+  start <- grep(
+    "^MS_METABOLITE_DATA_START",
+    x
+  )
+
+  end <- grep(
+    "^MS_METABOLITE_DATA_END",
+    x
+  )
+
+  if (length(start) == 0 ||
+      length(end) == 0) {
+
+    stop(
+      "MS_METABOLITE_DATA section not found in ",
+      analysis_id
+    )
+  }
+
+  x[
+    (start[1] + 1):(end[1] - 1)
+  ]
+}
+# ============================================================
+# 7. PARSE ST000915 LIPID DATA
+# ============================================================
+parse_lipid_analysis <- function(
+    analysis_id
+) {
+
+  section <- get_ms_section(
+    analysis_id
+  )
+
+  # Remove completely empty lines
+  section <- section[
+    nzchar(trimws(section))
+  ]
+
+  # --------------------------------------------------------
+  # Find rows containing actual NASH sample IDs
+  # --------------------------------------------------------
+
+  nash_pattern <- "NASH[0-9]+"
+
+  # Identify lines that contain NASH sample IDs
+  sample_lines <- section[
+    grepl(
+      nash_pattern,
+      section,
+      ignore.case = TRUE
+    )
+  ]
+
+  if (length(sample_lines) == 0) {
+    stop(
+      "No NASH sample IDs found in ",
+      analysis_id
+    )
+  }
+
+  # --------------------------------------------------------
+  # Locate the Samples row / line by searching for a line
+  # where NASH sample IDs occur consecutively
+  # --------------------------------------------------------
+
+  sample_line_index <- which(
+    sapply(
+      section,
+      function(z) {
+        ids <- str_extract_all(
+          z,
+          "(?i)NASH[0-9]+"
+        )[[1]]
+
+        length(ids) >= 2
+      }
+    )
+  )
+
+  if (length(sample_line_index) == 0) {
+
+    # Alternative: use first line containing NASH IDs
+    sample_line_index <- which(
+      grepl(
+        "(?i)NASH[0-9]+",
+        section
+      )
+    )
+  }
+
+  if (length(sample_line_index) == 0) {
+    stop(
+      "Could not locate sample information in ",
+      analysis_id
+    )
+  }
+
+  sample_line_index <- sample_line_index[1]
+
+  sample_line <- section[
+    sample_line_index
+  ]
+
+  # --------------------------------------------------------
+  # Extract sample IDs
+  # --------------------------------------------------------
+
+  sample_ids <- str_extract_all(
+    sample_line,
+    "(?i)NASH[0-9]+"
+  )[[1]]
+
+  sample_ids <- toupper(
+    sample_ids
+  )
+
+  sample_ids <- unique(
+    sample_ids
+  )
+
+  if (length(sample_ids) == 0) {
+    stop(
+      "No sample IDs extracted from ",
+      analysis_id
+    )
+  }
+
+  # --------------------------------------------------------
+  # Split sample line
+  # --------------------------------------------------------
+
+  sample_fields <- strsplit(
+    sample_line,
+    "\t",
+    fixed = TRUE
+  )[[1]]
+
+  sample_fields <- trimws(
+    sample_fields
+  )
+
+  # --------------------------------------------------------
+  # Find columns containing sample IDs
+  # --------------------------------------------------------
+
+  sample_cols <- which(
+    grepl(
+      "(?i)^NASH[0-9]+$",
+      sample_fields
+    )
+  )
+
+  # If IDs have prefixes/suffixes, locate them using
+  # exact position from the sample line
+  if (length(sample_cols) == 0) {
+
+    sample_cols <- which(
+      grepl(
+        "(?i)NASH[0-9]+",
+        sample_fields
+      )
+    )
+  }
+
+  if (length(sample_cols) == 0) {
+    stop(
+      "Could not identify sample columns in ",
+      analysis_id
+    )
+  }
+
+  sample_ids <- toupper(
+    str_extract(
+      sample_fields[
+        sample_cols
+      ],
+      "(?i)NASH[0-9]+"
+    )
+  )
+
+  # --------------------------------------------------------
+  # Determine feature rows
+  # --------------------------------------------------------
+
+  data_lines <- section[
+    (sample_line_index + 1):length(section)
+  ]
+
+  feature_list <- list()
+
+  for (line in data_lines) {
+
+    fields <- strsplit(
+      line,
+      "\t",
+      fixed = TRUE
+    )[[1]]
+
+    if (length(fields) <
+        max(sample_cols)) {
+      next
+    }
+
+    feature <- trimws(
+      fields[1]
+    )
+
+    if (
+      is.na(feature) ||
+      feature == ""
+    ) {
+      next
+    }
+
+    # Skip section/header lines
+    if (
+      grepl(
+        "^(DataType|Metabolite|Compound|Samples?)$",
+        feature,
+        ignore.case = TRUE
+      )
+    ) {
+      next
+    }
+
+    vals <- suppressWarnings(
+      as.numeric(
+        fields[
+          sample_cols
+        ]
+      )
+    )
+
+    feature_list[[feature]] <- vals
+  }
+
+  if (length(feature_list) == 0) {
+    stop(
+      "No lipid features extracted from ",
+      analysis_id
+    )
+  }
+
+  # --------------------------------------------------------
+  # Convert to matrix
+  # --------------------------------------------------------
+
+  feature_names <- names(
+    feature_list
+  )
+
+  mat <- do.call(
+    rbind,
+    feature_list
+  )
+
+  rownames(mat) <- feature_names
+  colnames(mat) <- sample_ids
+
+  mat
+}
+# ============================================================
+# 8. DOWNLOAD + PARSE ALL SIX ANALYSES
+# ============================================================
+matrix_list <- lapply(
+  analysis_ids,
+  parse_lipid_analysis
+)
+names(matrix_list) <- analysis_ids
+# ============================================================
+# 9. COMMON SAMPLES
+# ============================================================
+common_samples <- Reduce(
+  intersect,
+  lapply(
+    matrix_list,
+    colnames
+  )
+)
+if (length(common_samples) == 0) {
+  stop(
+    "No common samples across ST000915 lipid classes."
+  )
+}
+# ============================================================
+# 10. ALIGN ALL MATRICES
+# ============================================================
+matrix_list <- lapply(
+  matrix_list,
+  function(x) {
+
+    x[
+      ,
+      common_samples,
+      drop = FALSE
+    ]
+  }
+)
+# ============================================================
+# 11. COMBINE ALL LIPID CLASSES
+# ============================================================
+ext_mat <- do.call(
+  rbind,
+  matrix_list
+)
+# ============================================================
+# 12. REMOVE DUPLICATE FEATURES
+# ============================================================
+ext_mat <- ext_mat[
+  !duplicated(
+    rownames(ext_mat)
+  ),
+  ,
+  drop = FALSE
+]
+# ============================================================
+# 13. CHECK EXTERNAL MATRIX
+# ============================================================
+if (
+  nrow(ext_mat) == 0 ||
+  ncol(ext_mat) == 0
+) {
+
+  stop(
+    "External lipid matrix is empty."
+  )
+}
+# ============================================================
+# 14. DOWNLOAD METADATA
+# ============================================================
+meta_url <- paste0(
+  "https://www.metabolomicsworkbench.org/data/",
+  "study_textformat_view.php?",
+  "STUDY_ID=ST000915&",
+  "ANALYSIS_ID=AN001488&",
+  "MODE=d"
+)
+meta_lines <- readLines(
+  meta_url,
+  warn = FALSE
+)
+# ============================================================
+# 15. EXTRACT SUBJECT_SAMPLE_FACTORS
+# ============================================================
+ssf_lines <- meta_lines[
+  grep(
+    "^SUBJECT_SAMPLE_FACTORS",
+    meta_lines
+  )
+]
+ssf_lines <- ssf_lines[
+  !grepl(
+    "^#SUBJECT_SAMPLE_FACTORS",
+    ssf_lines
+  )
+]
+if (length(ssf_lines) == 0) {
+  stop(
+    "SUBJECT_SAMPLE_FACTORS not found."
+  )
+}
+# ============================================================
+# 16. PARSE CLINICAL METADATA
+# ============================================================
+parse_ssf <- function(x) {
+
+  fields <- strsplit(
+    x,
+    "\t",
+    fixed = TRUE
+  )[[1]]
+
+  if (length(fields) < 4) {
+    return(NULL)
+  }
+
+  sample <- trimws(
+    fields[3]
+  )
+
+  if (!grepl(
+    "^NASH[0-9]+$",
+    sample,
+    ignore.case = TRUE
+  )) {
+    return(NULL)
+  }
+
+  metadata <- paste(
+    fields[4:length(fields)],
+    collapse = "; "
+  )
+
+  diagnosis <- str_match(
+    metadata,
+    "(?i)Diagnosis:([^;]+)"
+  )[, 2]
+
+  sex <- str_match(
+    metadata,
+    "(?i)GENDER=([^;]+)"
+  )[, 2]
+
+  bmi <- str_match(
+    metadata,
+    "(?i)BMI=([^;]+)"
+  )[, 2]
+
+  age <- str_match(
+    metadata,
+    "(?i)AGE=([^;]+)"
+  )[, 2]
+
+  data.frame(
+    Sample = sample,
+    Diagnosis = trimws(
+      diagnosis
+    ),
+    Sex = trimws(
+      sex
+    ),
+    BMI = trimws(
+      bmi
+    ),
+    Age = trimws(
+      age
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+meta_list <- lapply(
+  ssf_lines,
+  parse_ssf
+)
+ext_meta <- bind_rows(
+  meta_list
+)
+if (nrow(ext_meta) == 0) {
+  stop(
+    "No ST000915 metadata were parsed."
+  )
+}
+# ============================================================
+# 17. CLEAN VARIABLES
+# ============================================================
+ext_meta$Age <- suppressWarnings(
+  as.numeric(
+    ext_meta$Age
+  )
+)
+ext_meta$BMI <- suppressWarnings(
+  as.numeric(
+    ext_meta$BMI
+  )
+)
+ext_meta$Sex <- toupper(
+  trimws(
+    ext_meta$Sex
+  )
+)
+# ============================================================
+# 18. DEFINE STEATOSIS
+# ============================================================
+# Keep ONLY Normal vs Steatosis
+ext_meta <- ext_meta[
+  ext_meta$Diagnosis %in% c("Normal", "Steatosis"),
+  ,
+  drop = FALSE
+]
+ext_meta$Steatosis <- ifelse(
+  ext_meta$Diagnosis == "Normal", 0, 1
+)
+# Check sample numbers
+table(ext_meta$Diagnosis)
+table(ext_meta$Steatosis)
+# ============================================================
+# 19. KEEP SAMPLES IN BOTH MATRIX + METADATA
+# ============================================================
+ext_meta <- ext_meta[
+  ext_meta$Sample %in%
+    colnames(ext_mat),
+  ,
+  drop = FALSE
+]
+ext_meta <- ext_meta[
+  !duplicated(
+    ext_meta$Sample
+  ),
+  ,
+  drop = FALSE
+]
+# ============================================================
+# 20. COMPLETE CASES
+# ============================================================
+keep <- complete.cases(
+  ext_meta[
+    ,
+    c(
+      "Age",
+      "BMI",
+      "Sex",
+      "Steatosis"
+    )
+  ]
+)
+ext_meta <- ext_meta[
+  keep,
+  ,
+  drop = FALSE
+]
+if (nrow(ext_meta) == 0) {
+  stop(
+    "No complete-case samples remain."
+  )
+}
+# ============================================================
+# 21. ALIGN MATRIX + METADATA
+# ============================================================
+ext_mat_limma <- ext_mat[
+  ,
+  ext_meta$Sample,
+  drop = FALSE
+]
+ext_meta <- ext_meta[
+  match(
+    colnames(ext_mat_limma),
+    ext_meta$Sample
+  ),
+  ,
+  drop = FALSE
+]
+rownames(ext_meta) <- ext_meta$Sample
+stopifnot(
+  nrow(ext_meta) > 0
+)
+stopifnot(
+  ncol(ext_mat_limma) > 0
+)
+stopifnot(
+  identical(
+    colnames(ext_mat_limma),
+    rownames(ext_meta)
+  )
+)
+# ============================================================
+# 22. LOG2 TRANSFORMATION
+# ============================================================
+ext_mat_log <- ext_mat_limma
+for (i in seq_len(
+  nrow(ext_mat_log)
+)) {
+
+  x <- as.numeric(
+    ext_mat_log[i, ]
+  )
+
+  positive <- x[
+    is.finite(x) &
+      x > 0
+  ]
+
+  if (length(positive) == 0) {
+
+    ext_mat_log[i, ] <- NA_real_
+
+    next
+  }
+
+  half_min <- min(
+    positive
+  ) / 2
+
+  x[
+    !is.finite(x) |
+      x <= 0
+  ] <- half_min
+
+  ext_mat_log[i, ] <- log2(
+    x
+  )
+}
+# ============================================================
+# 23. REMOVE ZERO-VARIANCE FEATURES
+# ============================================================
+feature_sd <- apply(
+  ext_mat_log,
+  1,
+  sd,
+  na.rm = TRUE
+)
+ext_mat_log <- ext_mat_log[
+  is.finite(feature_sd) &
+    feature_sd > 0,
+  ,
+  drop = FALSE
+]
+if (nrow(ext_mat_log) == 0) {
+  stop(
+    "No variable lipid features remain."
+  )
+}
+# ============================================================
+# 24. FACTORS
+# ============================================================
+ext_meta$Sex <- factor(
+  ext_meta$Sex
+)
+ext_meta$Steatosis <- factor(
+  ext_meta$Steatosis,
+  levels = c(
+    0,
+    1
+  )
+)
+# ============================================================
+# 25. LIMMA DESIGN
+# ============================================================
+design_ext <- model.matrix(
+  ~ Age + BMI + Sex + Steatosis,
+  data = ext_meta
+)
+coef_name <- "Steatosis1"
+if (!coef_name %in%
+    colnames(design_ext)
+) {
+
+  stop(
+    "Steatosis1 coefficient not found."
+  )
+}
+# ============================================================
+# 26. LIMMA
+# ============================================================
+fit_ext <- lmFit(
+  ext_mat_log,
+  design_ext
+)
+fit_ext <- eBayes(
+  fit_ext
+)
+# ============================================================
+# 27. EXTERNAL RESULTS
+# ============================================================
+res_ext <- topTable(
+  fit_ext,
+  coef = coef_name,
+  number = Inf,
+  sort.by = "none"
+)
+res_ext$Feature <- rownames(
+  res_ext
+)
+# ============================================================
+# 28. EXTERNAL SIGNIFICANT RESULTS
+# ============================================================
+res_ext_sig <- res_ext %>%
+  filter(
+    !is.na(adj.P.Val),
+    adj.P.Val <= 0.10,
+    !is.na(logFC)
+  ) %>%
+  mutate(
+    External_Direction = ifelse(
+      logFC > 0,
+      "Up",
+      "Down"
+    )
+  )
+# ============================================================
+# 29. CANONICAL LIPID MATCHING
+# ============================================================
+canonical_lipid <- function(x) {
+
+  x <- toupper(
+    trimws(
+      as.character(x)
+    )
+  )
+
+  # Remove class prefixes
+  x <- gsub(
+    "^(FATTY_ACIDS_EICOSANOIDS|STEROLS|PRENOLS_CARDIOLIPINS|NEUTRAL_LIPIDS|SPHINGOLIPIDS|PHOSPHOLIPIDS)\\.",
+    "",
+    x
+  )
+
+  # Remove spaces
+  x <- gsub(
+    "\\s+",
+    "",
+    x
+  )
+
+  # Keep lipid-relevant characters
+  x <- gsub(
+    "[^A-Z0-9:/(),+_-]",
+    "",
+    x
+  )
+
+  x
+}
+# ============================================================
+# 30. MATCH IDs
+# ============================================================
+int_steatosis$Match_ID <- canonical_lipid(
+  int_steatosis$Lipid
+)
+res_ext$Match_ID <- canonical_lipid(
+  res_ext$Feature
+)
+res_ext_sig$Match_ID <- canonical_lipid(
+  res_ext_sig$Feature
+)
+# ============================================================
+# 31. MATCH INTERNAL SIGNIFICANT LIPIDS
+# ============================================================
+matched <- int_steatosis %>%
+  inner_join(
+    res_ext %>%
+      select(
+        Match_ID,
+        External_Feature = Feature,
+        External_logFC = logFC,
+        External_FDR = adj.P.Val
+      ),
+    by = "Match_ID"
+  ) %>%
+  mutate(
+    External_Direction = ifelse(
+      External_logFC > 0,
+      "Up",
+      "Down"
+    ),
+    Direction = ifelse(
+      Internal_Direction ==
+        External_Direction,
+      "Same",
+      "Opposite"
+    ),
+    External_Significant =
+      !is.na(External_FDR) &
+      External_FDR <= 0.10
+  )
+# ============================================================
+# 32. COUNTS
+# ============================================================
+n_internal <- nrow(
+  int_steatosis
+)
+n_internal_up <- sum(
+  int_steatosis$Internal_Direction ==
+    "Up"
+)
+n_internal_down <- sum(
+  int_steatosis$Internal_Direction ==
+    "Down"
+)
+n_external_sig <- nrow(
+  res_ext_sig
+)
+n_external_up <- sum(
+  res_ext_sig$External_Direction ==
+    "Up"
+)
+n_external_down <- sum(
+  res_ext_sig$External_Direction ==
+    "Down"
+)
+n_matched <- nrow(
+  matched
+)
+n_same <- sum(
+  matched$Direction ==
+    "Same"
+)
+n_opposite <- sum(
+  matched$Direction ==
+    "Opposite"
+)
+n_same_up <- sum(
+  matched$Internal_Direction == "Up" &
+    matched$External_Direction == "Up"
+)
+n_same_down <- sum(
+  matched$Internal_Direction == "Down" &
+    matched$External_Direction == "Down"
+)
+n_opposite_up_down <- sum(
+  matched$Internal_Direction == "Up" &
+    matched$External_Direction == "Down"
+)
+n_opposite_down_up <- sum(
+  matched$Internal_Direction == "Down" &
+    matched$External_Direction == "Up"
+)
+n_external_sig_matched <- sum(
+  matched$External_Significant
+)
+n_not_measured <- n_internal -
+  n_matched
+# ============================================================
+# 33. CONCORDANCE
+# ============================================================
+concordance_pct <- ifelse(
+  n_matched > 0,
+  100 * n_same / n_matched,
+  NA_real_
+)
+# ============================================================
+# 34. SPEARMAN CORRELATION
+# ============================================================
+if (n_matched >= 3) {
+
+  spearman_test <- cor.test(
+    matched$Internal_logFC,
+    matched$External_logFC,
+    method = "spearman",
+    exact = FALSE
+  )
+
+  spearman_rho <- unname(
+    spearman_test$estimate
+  )
+
+  spearman_p <- spearman_test$p.value
+
+} else {
+
+  spearman_rho <- NA_real_
+  spearman_p <- NA_real_
+}
+# ============================================================
+# 35. FINAL TABLE
+# ============================================================
+final_concordance <- data.frame(
+
+  Phenotype =
+    "Steatosis",
+
+  External_Contrast =
+    "Normal vs Steatosis/NASH/Cirrhosis",
+
+  External_Model =
+    "Age + BMI + Sex + Steatosis",
+
+  External_N =
+    nrow(ext_meta),
+
+  Internal_Significant_FDR_0_10 =
+    n_internal,
+
+  Internal_Up =
+    n_internal_up,
+
+  Internal_Down =
+    n_internal_down,
+
+  External_Significant_FDR_0_10 =
+    n_external_sig,
+
+  External_Up =
+    n_external_up,
+
+  External_Down =
+    n_external_down,
+
+  Matched_Internal_Significant =
+    n_matched,
+
+  Same_Direction =
+    n_same,
+
+  Opposite_Direction =
+    n_opposite,
+
+  Same_Up =
+    n_same_up,
+
+  Same_Down =
+    n_same_down,
+
+  Opposite_Up_to_Down =
+    n_opposite_up_down,
+
+  Opposite_Down_to_Up =
+    n_opposite_down_up,
+
+  Concordance_Percent =
+    round(
+      concordance_pct,
+      2
+    ),
+
+  Matched_External_Significant =
+    n_external_sig_matched,
+
+  Not_Measured_Externally =
+    n_not_measured,
+
+  Spearman_Rho =
+    round(
+      spearman_rho,
+      4
+    ),
+
+  Spearman_P =
+    format.pval(
+      spearman_p,
+      digits = 4,
+      eps = 1e-300
+    ),
+
+  stringsAsFactors = FALSE
+)
+# ============================================================
+# 36. ONLY PRINT FINAL RESULT
+# ============================================================
+print(
+  final_concordance,
+  row.names = FALSE
+)
+# ============================================================
+# ST000915 STEATOSIS VALIDATION
+# NORMAL vs STEATOSIS ONLY
+# ============================================================
+library(writexl)
+# ============================================================
+# 1. EXTERNAL RESULTS
+# ============================================================
+# res_ext ALREADY contains "Feature"
+external_st <- res_ext %>%
+    mutate(
+        External_ID = canonical_lipid(Feature),
+        External_logFC = logFC,
+        External_FDR = adj.P.Val,
+        External_Direction = case_when(
+            logFC > 0 ~ "Up",
+            logFC < 0 ~ "Down",
+            TRUE ~ "No change"
+        )
+    )
+# ============================================================
+# 2. INTERNAL DISCOVERY RESULTS
+#    Steatosis, FDR ≤ 0.10
+# ============================================================
+discovery_st <- my_results %>%
+    filter(
+        Phenotype == "Steatosis",
+        !is.na(adj.P.Val),
+        adj.P.Val <= 0.10
+    ) %>%
+    mutate(
+        Discovery_ID = canonical_lipid(`Lipid main ID`),
+        Discovery_logFC = logFC,
+        Discovery_FDR = adj.P.Val,
+        Discovery_Direction = Direction
+    )
+# ============================================================
+# 3. MATCH INTERNAL DISCOVERY TO ST000915
+# ============================================================
+matched <- discovery_st %>%
+    left_join(
+        external_st %>%
+            select(
+                External_ID,
+                Feature,
+                External_logFC,
+                External_FDR,
+                External_Direction
+            ),
+        by = c("Discovery_ID" = "External_ID")
+    ) %>%
+    mutate(
+        Measured_externally = !is.na(External_logFC),
+        Direction_concordant = case_when(
+            !Measured_externally ~ NA,
+            Discovery_logFC > 0 & External_logFC > 0 ~ TRUE,
+            Discovery_logFC < 0 & External_logFC < 0 ~ TRUE,
+            TRUE ~ FALSE
+        )
+    )
+# ============================================================
+# 4. TABLE S14A
+#    VALIDATION SUMMARY
+# ============================================================
+discovery_n <- nrow(discovery_st)
+external_sig_n <- sum(
+    matched$Measured_externally &
+        matched$External_FDR <= 0.10,
+    na.rm = TRUE
+)
+measured_n <- sum(
+    matched$Measured_externally,
+    na.rm = TRUE
+)
+same_n <- sum(
+    matched$Direction_concordant == TRUE,
+    na.rm = TRUE
+)
+opposite_n <- sum(
+    matched$Direction_concordant == FALSE,
+    na.rm = TRUE
+)
+concordance_pct <- ifelse(
+    measured_n > 0,
+    100 * same_n / measured_n,
+    NA_real_
+)
+Table_S14A <- data.frame(
+    Phenotype = "Steatosis",
+    Contrast = "Normal vs Steatosis",
+    `Discovery significant` = discovery_n,
+    `External significant` = external_sig_n,
+    `Measured externally` = measured_n,
+    `Same direction` = same_n,
+    `Opposite direction` = opposite_n,
+    `Percent concordant` = concordance_pct
+)
+cat("\n================ TABLE S14A ================\n")
+print(Table_S14A, row.names = FALSE)
+# ============================================================
+# 5. TABLE S14B
+#    FEATURE-LEVEL VALIDATION
+# ============================================================
+Table_S14B <- matched %>%
+    transmute(
+        Phenotype = Phenotype,
+        `Lipid main ID` = `Lipid main ID`,
+        `Lipid Class` = `Lipid Class`,
+        DiscoverylogFC = Discovery_logFC,
+        DiscoveryFDR = Discovery_FDR,
+        DiscoveryDirection = Discovery_Direction,
+        ExternallogFC = External_logFC,
+        ExternalFDR = External_FDR,
+        ExternalDirection = External_Direction,
+        Measuredexternally = Measured_externally,
+        Directionconcordant = Direction_concordant
+    ) %>%
+    arrange(
+        desc(Measuredexternally),
+        DiscoveryFDR
+    )
+cat("\n================ TABLE S14B ================\n")
+print(Table_S14B, row.names = FALSE)
+# ============================================================
+# 6. SANITY CHECK
+# ============================================================
+cat("\n================ SANITY CHECK ================\n")
+cat(
+    "Discovery-significant lipids:",
+    discovery_n,
+    "\n"
+)
+cat(
+    "Measured externally:",
+    measured_n,
+    "\n"
+)
+cat(
+    "External significant:",
+    external_sig_n,
+    "\n"
+)
+cat(
+    "Same direction:",
+    same_n,
+    "\n"
+)
+cat(
+    "Opposite direction:",
+    opposite_n,
+    "\n"
+)
+cat(
+    "Percent concordant:",
+    round(concordance_pct, 2),
+    "%\n"
+)
+
+```
+
+## Tables S8 and S9
+
+```{r external-10, message=FALSE, warning=FALSE}
+add_table("Table S8", setNames(Table_S14A, gsub("\\.", " ", names(Table_S14A))))
+S9 <- Table_S14B
+names(S9) <- c("Phenotype", "Lipid main ID", "Lipid Class", "Discovery logFC", "Discovery FDR", "Discovery Direction",
+               "External logFC", "External FDR", "External Direction", "Measured externally", "Direction concordant")[seq_along(names(S9))]
+add_table("Table S9", S9)
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Fig3_external_validation")   # lets the next step start from here
+```
