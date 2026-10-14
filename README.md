@@ -103,7 +103,6 @@ masld-sex-stratified-multiomics/
 ├── Fig6_pathway_map/
 ├── Supp_EPoS_serum_validation/
 ├── Supp_methods_tables/                 # Tables S17-S18 only (no code)
-├── Assemble_supplementary_tables/       # collects all tables into one workbook
 ├── data/                                # input files, not tracked (see data/README.md)
 ├── results/                             # created when the code runs, not tracked
 └── assets/                              # README graphics
@@ -128,7 +127,6 @@ Each `<folder>/Source_data/` holds the Supplementary Tables used by that item (`
 | Fig. 6 | Liver-to-serum pathway map | S1, S3, S4, S10a, S10b, S12 | `Fig6_pathway_map` |
 | Supplementary | EPoS (ST001711) serum validation | S19, S20 | `Supp_EPoS_serum_validation` |
 | Supplementary | LC-MS conditions, external datasets | S17, S18 | `Supp_methods_tables` |
-| Supplementary | All tables in one workbook | S1–S12, S19–S20 | `Assemble_supplementary_tables` |
 
 Tables used by more than one item are stored in each folder that uses them. Tables S13–S16 (network and mediation analyses) are not part of this repository.
 
@@ -146,7 +144,7 @@ Sys.setenv(MASLD_DATA_DIR = "/path/to/folder/containing/Analyisis")   # only if 
 
 The analyses build on each other (Fig. 1 DESeq2 results → Fig. 3; hepatic and serum limma → Fig. 4 → Figs 5–6). Each script ends by saving its workspace to `results/cache/` and starts by loading the previous step, or by running it first if needed. The order is:
 
-`Table1_cohort` → `Fig1_hepatic_transcriptome` → `Hepatic_lipidome` → `Hepatic_polar_metabolome` → `Fig2_serum_metabolome` → `Fig3_external_validation` → `Fig4_paired_liver_serum` → `Fig5_pPRS` → `Fig6_pathway_map` → `Supp_EPoS_serum_validation` → `Assemble_supplementary_tables`
+`Table1_cohort` → `Fig1_hepatic_transcriptome` → `Hepatic_lipidome` → `Hepatic_polar_metabolome` → `Fig2_serum_metabolome` → `Fig3_external_validation` → `Fig4_paired_liver_serum` → `Fig5_pPRS` → `Fig6_pathway_map` → `Supp_EPoS_serum_validation`
 
 The first run of a later figure therefore also runs everything before it; later runs reuse the cache.
 
