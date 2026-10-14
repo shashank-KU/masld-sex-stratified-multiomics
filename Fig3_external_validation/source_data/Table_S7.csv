@@ -1,0 +1,8 @@
+﻿Direction,ID,Description,Category,Discovery FDR,Discovery genes,GSE162694 FDR,GSE162694 genes,GSE162694 significant,GSE135251 FDR,GSE135251 genes,GSE135251 significant,GSE135251 (sex-adjusted) FDR,GSE135251 (sex-adjusted) genes,GSE135251 (sex-adjusted) significant,Replicated in,
+Down,hsa00380,Tryptophan metabolism,Metabolism,0.000449419357588979,3,0.0175487497307808,8,True,,,False,0.0878832581166257,8,True,GSE162694,
+Up,hsa05219,Bladder cancer,Human Diseases,0.0441673725340206,3,0.000403683912701948,15,True,0.00633880044351929,11,True,0.0233689418146569,10,True,GSE162694 + GSE135251,
+Up,hsa05160,Hepatitis C,Human Diseases,0.00200589383560063,7,0.30411289583217,24,False,0.0558681447151677,23,True,0.051229678888459,24,True,GSE135251,
+Up,hsa05164,Influenza A,Human Diseases,0.0132087662893319,6,6.96997350139324e-06,42,True,,,False,,,False,GSE162694,
+Up,hsa05206,MicroRNAs in cancer,Human Diseases,0.0153170509525675,6,0.00200946204390386,38,True,,,False,0.0691326059136509,40,True,GSE162694,
+Up,hsa05169,Epstein-Barr virus infection,Human Diseases,0.0247749271364194,6,3.31048417173511e-10,60,True,,,False,,,False,GSE162694,
+Up,hsa04915,Estrogen signaling pathway,Organismal Systems,0.0910972309080025,4,0.999999996094437,14,False,,,False,,,False,none,
