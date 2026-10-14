@@ -1,0 +1,486 @@
+---
+title: "Fig. 6: liver-to-serum pathway map"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Fig6_pathway_map.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig5_pPRS`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig5_pPRS")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Fig6_pathway_map")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Liver-to-serum pathway map: Fig. 6
+
+Anatomical pathway figure built from Tables S1, S3, S4, S10a, S10b and S12 of the Supplementary Tables workbook.
+
+```{r livertos-01}
+## =============================================================================
+##  ANATOMICAL LIVER -> SERUM PATHWAY FIGURE  (publication version)
+##  Gupta et al., matched liver–serum multi-omics in severe obesity (Nat Metab)
+##
+##  A liver silhouette holds the hepatic pathways; a blood vessel holds the
+##  serum metabolites; amino acids enter and bile acids leave across the
+##  sinusoidal membrane through the transporters, drawn on the liver edge.
+##
+##  Encoding (identical everywhere):
+##   metabolite circles: left half = steatosis, right half = lobular inflammation;
+##                       fill = effect, black rim = FDR <= 0.10
+##   enzymes/transporters: italic name + two tiles (steatosis | inflammation)
+##   Δ next to a serum metabolite = liver–serum discordant (paired model)
+##
+##  All numbers are read from the Supplementary Tables, which are located by
+##  their content (not by "Table S5"), so renumbering does not break anything.
+##  Only the drawing (positions of nodes/arrows) is written by hand.
+##  Output: PDF (vector), SVG (editable), PNG and TIFF at 600 dpi, value table.
+## =============================================================================
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(tidyr); library(stringr); library(ggplot2)
+})
+XLSX    <- SUPP_XLSX
+OUT_DIR <- results_dir
+STEM    <- "Fig6_pathway_map"
+FONT    <- "Helvetica"
+PH      <- c("Steatosis", "Inflammation")
+MET_FDR <- 0.10
+CAP     <- 0.6                          # colour scale limit (|effect|)
+TS      <- 1.15                         # text scale: 1 = original, 1.15 = 15% larger
+W <- 180; H <- 195                      # mm
+## =============================================================================
+## 1. DATA (tables located by content)
+## =============================================================================
+norm_met <- function(x) gsub("^_|_$", "", gsub("[^A-Z0-9]+", "_", toupper(trimws(as.character(x)))))
+catalogue <- lapply(excel_sheets(XLSX), function(s) {
+  top <- suppressMessages(read_excel(XLSX, sheet = s, n_max = 8, col_names = FALSE, .name_repair = "minimal"))
+  hdr <- NA_integer_
+  for (r in 2:nrow(top)) { v <- unlist(top[r, ]); if (sum(!is.na(v) & nzchar(v)) >= 3) { hdr <- r; break } }
+  list(sheet = s, title = as.character(top[[1]][1]), header = hdr,
+       cols = if (is.na(hdr)) character(0) else as.character(unlist(top[hdr, ])))
+})
+find_table <- function(label, need, title_has = NULL, title_not = NULL) {
+  hit <- Filter(function(s)
+    all(vapply(need, function(p) any(str_detect(s$cols, regex(p, ignore_case = TRUE))), TRUE)) &&
+      (is.null(title_has) || str_detect(s$title, regex(title_has, ignore_case = TRUE))) &&
+      (is.null(title_not) || !str_detect(s$title, regex(title_not, ignore_case = TRUE))), catalogue)
+  if (length(hit) != 1) stop(sprintf("Cannot identify the %s table (%d candidates).", label, length(hit)), call. = FALSE)
+  h <- hit[[1]]; message(sprintf("  %-20s <- %s", label, h$sheet))
+  d <- read_excel(XLSX, sheet = h$sheet, skip = h$header - 1, .name_repair = "minimal"); attr(d, "sheet") <- h$sheet; d
+}
+col_of <- function(d, p) { h <- names(d)[str_detect(names(d), regex(p, ignore_case = TRUE))]
+  if (!length(h)) stop("No column matching '", p, "'", call. = FALSE); h[1] }
+tag <- function(d) str_remove(attr(d, "sheet"), "^Table ")
+message("Locating tables:")
+T_gene  <- find_table("hepatic genes", c("^Ensembl gene ID$", "^log2FoldChange$", "^padj$", "^Histology$", "symbol"))
+T_lip   <- find_table("hepatic lipids", c("^Lipid main ID$", "^Lipid Class$", "^(logFC|effect)"), title_not = "ST000915|external")
+T_liver <- find_table("hepatic metabolites", c("^Metabolite$", "^Phenotype$", "^(logFC|effect)", "m/z"), title_not = "serum")
+T_serum <- find_table("serum metabolites", c("^Metabolite$", "^Phenotype$", "^(logFC|effect)"), title_has = "serum", title_not = "paired|matched")
+T_pair  <- find_table("paired liver-serum", c("^Metabolite$", "^Liver (log2FC|effect)", "^Serum (log2FC|effect)", "^Discordant"))
+prs_sheet <- Filter(function(s) str_detect(s$title, regex("polygenic", ignore_case = TRUE)), catalogue)[[1]]$sheet
+message(sprintf("  %-20s <- %s", "pPRS", prs_sheet))
+raw <- suppressMessages(read_excel(XLSX, sheet = prs_sheet, col_names = FALSE, .name_repair = "minimal"))
+h0 <- which(raw[[1]] == "outcome")[1]; end <- h0 + which(is.na(raw[[1]][(h0 + 1):nrow(raw)]))[1] - 1
+hn <- as.character(unlist(raw[h0, ])); keep <- !is.na(hn) & nzchar(hn)
+prs <- raw[(h0 + 1):end, keep]; names(prs) <- hn[keep]
+prs <- prs |> transmute(outcome, pPRS, beta = as.numeric(`beta per SD`), se = as.numeric(SE), p = as.numeric(p)) |>
+  mutate(p = ifelse(p == 0, 2 * pnorm(-abs(beta / se)), p))
+gene <- T_gene |> transmute(ph = Histology, sym = .data[[col_of(T_gene, "symbol")]],
+                            v = as.numeric(log2FoldChange), f = as.numeric(padj)) |>
+  filter(!is.na(sym), ph %in% PH) |> group_by(ph, sym) |> slice_min(f, n = 1, with_ties = FALSE) |> ungroup()
+liver <- T_liver |> transmute(ph = Phenotype, key = norm_met(Metabolite),
+  v = as.numeric(.data[[col_of(T_liver, "^(logFC|effect)")]]), f = as.numeric(.data[[col_of(T_liver, "adj\\.P\\.Val|FDR")]]))
+serum <- T_serum |> transmute(ph = Phenotype, key = norm_met(Metabolite),
+  v = as.numeric(.data[[col_of(T_serum, "^(logFC|effect)")]]), f = as.numeric(.data[[col_of(T_serum, "adj\\.P\\.Val|FDR")]]))
+pair <- T_pair |> filter(!is.na(Metabolite), Phenotype %in% PH) |>
+  transmute(ph = Phenotype, key = norm_met(Metabolite),
+            L = as.numeric(.data[[col_of(T_pair, "^Liver (log2FC|effect)")]]), Lf = as.numeric(.data[[col_of(T_pair, "^Liver FDR")]]),
+            S = as.numeric(.data[[col_of(T_pair, "^Serum (log2FC|effect)")]]), Sf = as.numeric(.data[[col_of(T_pair, "^Serum FDR")]]),
+            disc = as.logical(.data[[col_of(T_pair, "^Discordant")]]))
+tg <- T_lip |> filter(str_detect(norm_met(`Lipid Class`), "^TG"), Phenotype %in% PH) |>
+  group_by(ph = Phenotype) |>
+  summarise(v = median(as.numeric(.data[[col_of(T_lip, "^(logFC|effect)")]])),
+            f = min(as.numeric(.data[[col_of(T_lip, "adj\\.P\\.Val|FDR")]])), .groups = "drop")
+for (d in list(T_gene, T_liver, T_serum, T_lip)) if ("Direction" %in% names(d)) {
+  x <- as.numeric(d[[col_of(d, "^(log2FoldChange|logFC|effect)")]])
+  if (!all((x > 0) == (str_trim(d$Direction) == "Up"), na.rm = TRUE)) stop("Sign/Direction mismatch in ", attr(d, "sheet"))
+}
+message("  ok: effect signs agree with the Direction column")
+## value of one metabolite in one compartment: paired table first (all
+## estimates, n = 187), else the separate table (significant features only)
+met_val <- function(key, comp) {
+  if (is.na(key)) return(tibble(ph = PH, v = NA_real_, f = NA_real_, src = "none"))
+  if (key == "TG") return(tg |> mutate(src = "lipid table"))
+  pr <- filter(pair, key == !!key)
+  if (nrow(pr)) return(pr |> transmute(ph, v = if (comp == "liver") L else S, f = if (comp == "liver") Lf else Sf,
+                                       src = "paired"))
+  tb <- if (comp == "liver") liver else serum
+  tibble(ph = PH) |> left_join(filter(tb, key == !!key) |> select(ph, v, f), by = "ph") |>
+    mutate(src = if (comp == "liver") "liver table" else "serum table")
+}
+## =============================================================================
+## 2. DRAWING SPECIFICATION (mm; y up)
+##    organ icon (top-left) -> zoom -> HEPATOCYTE (pathway cards) | sinusoidal
+##    membrane (transporters) | SINUSOID / BLOOD (serum metabolites);
+##    canalicular membrane (ABCB11) -> bile canaliculus at the bottom.
+## =============================================================================
+CELL  <- c(x0 = 2, x1 = 128, y0 = 12, y1 = 150)
+X_MEM <- 128                 # sinusoidal (basolateral) membrane = right edge of the cell
+X_VES <- c(137, 177)         # sinusoid
+X_SER <- 146                 # serum node x
+R     <- 2.25                # metabolite circle radius
+MET <- tribble(
+  ~id,     ~lab,       ~key,             ~x,    ~y,    ~exp,  ~skey,
+  "leu",   "Leu/Ile",  "LEUCIN",         112,  139,    TRUE,  "ISOLEUCINE",
+  "val",   "Val",      "VALINE",         112,  132,    TRUE,  "VALINE",
+  "phe",   "Phe",      "PHENYLALANINE",  112,  124,    TRUE,  "PHENYLALANINE",
+  "tyr",   "Tyr",      "TYROSINE",       112,  117,    TRUE,  "TYROSINE",
+  "gln",   "Gln",      "GLUTAMINE",      112,  104,    TRUE,  "GLUTAMINE",
+  "glu",   "Glu",      "GLUTAMIC_ACID",  112,   97,    TRUE,  "GLUTAMIC_ACID",
+  "lys",   "Lys",      "LYSINE",         112,   90,    TRUE,  "LYSINE",
+  "asp",   "Asp",      "ASPARTIC_ACID",   80,   90,    FALSE, NA,
+  "trp",   "Trp",      "TRYPTOPHAN",     112,   73.8,    TRUE,  "TRYPTOPHAN",
+  "gca",   "GCA",      "GCA",            112,   53,    TRUE,  "GCA",
+  "tca",   "TCA",      "TCA",            112,   46.5,  TRUE,  "TCA",
+  "tdca",  "TDCA",     "TDCA",           112,   40,    TRUE,  "TDCA",
+  "tg",    "TG",       "TG",              17,   73,    FALSE, NA)
+SER_ONLY <- tribble(~lab, ~skey, ~y, "KMV", "3_METHYL_2_OXOVALERATE", 145)
+TXT <- tribble(
+  ~lab,                       ~x,  ~y,
+  "BCKAs",                    82, 135.5,
+  "Acyl-CoAs",                60, 135.5,
+  "Succinyl-/\nacetyl-CoA",   60, 121.5,
+  "Homogentisate",            84, 117,
+  "Fumarate,\nacetoacetate",  42, 117,
+  "2-OG",                     79, 103,
+  "Urea cycle",               49,  90,
+  "NH₄⁺",                     49, 101,
+  "Kyn",                      95,  73.8,
+  "3-HK",                     80,  73.8,
+  "3-HAA",                    65,  73.8,
+  "ACMS",                     52,  73.8,
+  "Picolinate",               35,  73.8,
+  "KYNA",                     95,  65,
+  "NAD⁺",                     52,  65,
+  "Cholesterol",              52,  46.5,
+  "CA, CDCA",                 78,  46.5)
+ARR <- tribble(
+  ~from,           ~to,                     ~enz,                  ~lty,     ~lab_side,
+  "leu",           "BCKAs",                 "BCAT1",               "solid",  "above",
+  "val",           "BCKAs",                 "",                    "solid",  "none",
+  "BCKAs",         "Acyl-CoAs",             "BCKDHB",              "solid",  "above",
+  "Acyl-CoAs",     "Succinyl-/\nacetyl-CoA", "IVD;ACADSB;ALDH6A1;MMUT", "dashed", "right",
+  "phe",           "tyr",                   "",                    "dashed", "none",
+  "tyr",           "Homogentisate",         "",                    "dashed", "none",
+  "Homogentisate", "Fumarate,\nacetoacetate", "HGD",               "solid",  "below",
+  "gln",           "glu",                   "GLS",                 "solid",  "right",
+  "glu",           "2-OG",                  "GPT2",                "solid",  "below",
+  "glu",           "asp",                   "GOT1",                "solid",  "below",
+  "asp",           "Urea cycle",            "ASS1",                "solid",  "below",
+  "NH₄⁺",          "Urea cycle",            "CPS1",                "solid",  "right",
+  "trp",           "Kyn",                   "TDO2",                "solid",  "above",
+  "Kyn",           "3-HK",                  "KMO",                 "solid",  "below",
+  "3-HK",          "3-HAA",                 "KYNU",                "solid",  "above",
+  "3-HAA",         "ACMS",                  "HAAO",                "solid",  "below_r",
+  "ACMS",          "Picolinate",            "ACMSD",               "solid",  "above",
+  "Kyn",           "KYNA",                  "AADAT",               "solid",  "right",
+  "ACMS",          "NAD⁺",                  "",                    "dashed", "none",
+  "Cholesterol",   "CA, CDCA",              "CYP7A1;CYP27A1",      "solid",  "above",
+  "CA, CDCA",      "gca",                   "SLC27A5",             "solid",  "above_l",
+  "CA, CDCA",      "tca",                   "",                    "solid",  "none",
+  "CA, CDCA",      "tdca",                  "",                    "dashed", "none")
+CARD <- tribble(
+  ~title,                                       ~x0, ~x1,  ~y0,   ~y1,
+  "Branched-chain and aromatic amino acids",     33, 120, 111.5, 148,
+  "Glutamine, glutamate, aspartate and urea cycle", 33, 120, 84.5, 109.5,
+  "Tryptophan–kynurenine",                       26, 120,  61.5,  82.5,
+  "Bile acids",                                  36, 120,  25,    59.5)
+## transporters: on the sinusoidal membrane (x = X_MEM) at the y of their substrate;
+## ABCB11 sits on the canalicular membrane (bottom of the cell)
+TRP <- tribble(~gene,   ~x,     ~y,
+  "SLC3A2", X_MEM,  128,
+  "SLC1A2", X_MEM,   97,
+  "SLC7A2", X_MEM,   90,
+  "ABCC4",  X_MEM,   49.8,
+  "SLC51A", X_MEM,   40,
+  "ABCB11", 104,     CELL[["y0"]])
+## =============================================================================
+## 3. GEOMETRY HELPERS
+## =============================================================================
+crspline <- function(pts, n = 30) {
+  P <- rbind(pts[nrow(pts), ], pts, pts[1:2, ]); out <- NULL
+  for (i in 2:(nrow(P) - 2)) {
+    t <- seq(0, 1, length.out = n)[-n]; p0 <- P[i - 1, ]; p1 <- P[i, ]; p2 <- P[i + 1, ]; p3 <- P[i + 2, ]
+    f <- function(k) 0.5 * ((2 * p1[k]) + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t^2 +
+                              (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t^3)
+    out <- rbind(out, cbind(f(1), f(2)))
+  }
+  tibble(x = out[, 1], y = out[, 2])
+}
+rrect <- function(x0, x1, y0, y1, r = 2, n = 8) {
+  a <- seq(0, pi / 2, length.out = n); cx <- c(x1 - r, x0 + r, x0 + r, x1 - r); cy <- c(y1 - r, y1 - r, y0 + r, y0 + r)
+  st <- c(0, pi / 2, pi, 3 * pi / 2)
+  bind_rows(lapply(1:4, \(k) tibble(x = cx[k] + r * cos(st[k] + a), y = cy[k] + r * sin(st[k] + a))))
+}
+half <- function(x, y, r, side, n = 30) {
+  a <- if (side == "L") seq(pi / 2, 3 * pi / 2, length.out = n) else seq(-pi / 2, pi / 2, length.out = n)
+  tibble(x = c(x, x + r * cos(a)), y = c(y, y + r * sin(a)))
+}
+circ <- function(x, y, r, n = 50) { t <- seq(0, 2 * pi, length.out = n); tibble(x = x + r * cos(t), y = y + r * sin(t)) }
+ell  <- function(x, y, a, rx, ry, n = 50) { t <- seq(0, 2 * pi, length.out = n); th <- a * pi / 180
+  tibble(x = x + rx * cos(t) * cos(th) - ry * sin(t) * sin(th), y = y + rx * cos(t) * sin(th) + ry * sin(t) * cos(th)) }
+cw <- function(s, pt) nchar(s) * pt * TS * 0.3528 * 0.64      # text width (mm), follows TS
+## organ icon: anterior liver (large right lobe on the viewer's left, left lobe
+## tapering to the upper right, gallbladder at the inferior border)
+org_x0 <- 4; org_y0 <- 154; sc <- 0.30
+liver_icon <- crspline(rbind(
+  c(4, 38), c(10, 52), c(28, 60), c(52, 61), c(76, 58), c(98, 54), c(112, 49), c(110, 44), c(92, 37),
+  c(70, 28), c(58, 22), c(50, 16), c(40, 6), c(26, 4), c(13, 10), c(5, 22)), n = 22) |>
+  mutate(x = org_x0 + x * sc, y = org_y0 + y * sc)
+lig <- tibble(x = org_x0 + c(60, 58, 55) * sc, y = org_y0 + c(60, 40, 22) * sc)          # falciform ligament
+gb_icon <- crspline(rbind(c(42, 10), c(47, 4), c(48, -3), c(43, -5), c(39, 0), c(39, 7)), n = 14) |>
+  mutate(x = org_x0 + x * sc, y = org_y0 + y * sc)
+zoom <- c(x0 = org_x0 + 22 * sc, x1 = org_x0 + 34 * sc, y0 = org_y0 + 28 * sc, y1 = org_y0 + 40 * sc)
+## node lookup; metabolite nodes extend left by their label (label sits left of the circle)
+pos <- bind_rows(
+  MET |> transmute(id, x, y, wl = R + 0.9 + cw(lab, 6), wr = R + 0.4, h = 2 * R + 0.4),
+  TXT |> transmute(id = lab, x, y, wl = vapply(str_split(lab, "\n"), \(z) max(cw(z, 6)), 0) / 2 + 0.6,
+                   wr = vapply(str_split(lab, "\n"), \(z) max(cw(z, 6)), 0) / 2 + 0.6, h = 2.6 * (str_count(lab, "\n") + 1)))
+arrows <- ARR |>
+  left_join(rename_with(pos, ~ paste0(.x, "0"), -id), by = c(from = "id")) |>
+  left_join(rename_with(pos, ~ paste0(.x, "1"), -id), by = c(to = "id")) |>
+  mutate(dx = x1 - x0, dy = y1 - y0, d = sqrt(dx^2 + dy^2),
+         s0 = abs(dx) / d * ifelse(dx < 0, wl0, wr0) + abs(dy) / d * (h0 / 2 + 0.5) + 0.5,
+         s1 = abs(dx) / d * ifelse(dx < 0, wr1, wl1) + abs(dy) / d * (h1 / 2 + 0.5) + 0.5,
+         xs = x0 + dx / d * s0, ys = y0 + dy / d * s0, xe = x1 - dx / d * s1, ye = y1 - dy / d * s1,
+         mx = (xs + xe) / 2, my = (ys + ye) / 2)
+stopifnot(!anyNA(arrows$x0), !anyNA(arrows$x1))
+TW <- 2.9 * sqrt(TS); TH <- 2.3 * sqrt(TS); EPT <- 5.2
+enz <- arrows |> filter(nzchar(enz)) |> mutate(k = row_number()) |>
+  separate_rows(enz, sep = ";") |> group_by(k) |> mutate(j = row_number(), nj = n()) |> ungroup() |>
+  mutate(gw = cw(enz, EPT) + 0.8 + 2 * TW + 0.3,
+         gx = case_when(lab_side == "right" ~ mx + 1.4, lab_side == "left" ~ mx - 1.4 - gw, lab_side == "below_r" ~ mx - 2.5, lab_side == "above_l" ~ mx - gw - 0.5, TRUE ~ mx - gw / 2),
+         gy = case_when(lab_side == "above" ~ my + 2.2 + (nj - j) * 2.9,
+                        lab_side == "above_l" ~ my + 2.4,
+                        lab_side %in% c("below", "below_r") ~ my - 2.2 - (j - 1) * 2.9,
+                        TRUE ~ my + ((nj + 1) / 2 - j) * 2.9))
+enz_t <- enz |> crossing(ph = PH) |> mutate(i = match(ph, PH), tx = gx + cw(enz, EPT) + 0.8 + TW / 2 + (i - 1) * (TW + 0.3)) |>
+  left_join(gene, by = c(enz = "sym", "ph"))
+liv_vals <- MET |> rowwise() |> mutate(d = list(met_val(key, "liver"))) |> ungroup() |> unnest(d)
+ser_nodes <- bind_rows(MET |> filter(exp) |> transmute(lab, skey, y), SER_ONLY) |> mutate(x = X_SER)
+ser_vals <- ser_nodes |> rowwise() |> mutate(d = list(met_val(skey, "serum"))) |> ungroup() |> unnest(d)
+disc <- pair |> filter(disc) |> group_by(key) |> summarise(which = paste(substr(ph, 1, 1), collapse = ","), .groups = "drop")
+ser_nodes <- ser_nodes |> left_join(disc, by = c(skey = "key")) |> mutate(in_pair = skey %in% pair$key)
+halves <- function(vals) bind_rows(lapply(seq_len(nrow(vals)), \(i) {
+  r <- vals[i, ]; half(r$x, r$y, R, ifelse(r$ph == PH[1], "L", "R")) |>
+    mutate(g = paste(r$lab, r$ph, r$x), v = r$v, sig = !is.na(r$f) & r$f <= MET_FDR)
+}))
+liv_h <- halves(liv_vals); ser_h <- halves(ser_vals)
+tr <- TRP |> mutate(gw = cw(gene, EPT) + 0.8 + 2 * TW + 0.3, gx = x - gw / 2)
+tr_t <- tr |> crossing(ph = PH) |> mutate(i = match(ph, PH), tx = gx + cw(gene, EPT) + 0.8 + TW / 2 + (i - 1) * (TW + 0.3)) |>
+  left_join(gene, by = c(gene = "sym", "ph"))
+## decorations
+drops <- tibble(x = c(9, 21, 13, 22.5, 7.5, 18.5, 23, 10), y = c(85, 83, 64, 64, 74, 56, 75, 54),
+                r = c(3.2, 2.6, 2.4, 2.0, 1.9, 2.2, 1.6, 1.7))
+mito  <- tibble(x = c(15, 24, 9, 22), y = c(40, 31, 27, 23), a = c(25, -20, 10, 60))
+rbc   <- tibble(x = c(171.5, 168, 172, 168.5, 171.5, 168, 172.5, 167.5, 171, 169), y = c(150, 124, 108, 83, 68, 59, 33, 22, 12, 138),
+                a = c(20, -30, 10, 45, -15, 30, -40, 15, 0, -10))
+fenes <- tibble(y0 = seq(14, 148, by = 9)) |> mutate(y1 = y0 + 5.5)            # fenestrated endothelium dashes
+b_liv <- filter(prs, outcome == "TG_liver", pPRS == "pprs_disc")
+b_ser <- filter(prs, outcome == "TG_serum", pPRS == "pprs_disc")
+sup <- function(n) chartr("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹", as.character(n))
+fmt_p <- function(p) { e <- floor(log10(p)); if (p >= 0.001) sprintf("P = %.3f", p) else sprintf("P = %.1f × 10%s", p / 10^e, sup(e)) }
+fmt_b <- function(b) sub("-", "−", sprintf("%+.2f", b))
+nuc <- c(x = 16, y = 124, rx = 12.5, ry = 15)
+y_stg <- 18
+## serum-TG arrow path: from the nucleus down the inside of the cell wall
+bp <- rbind(c(7.6, 111.5), c(5.4, 95), c(5.6, 60), c(6.5, 30), c(9.5, 21), c(16, y_stg))
+tt <- seq_len(nrow(bp)); ts <- seq(1, nrow(bp), length.out = 200)
+blue_path <- tibble(x = spline(tt, bp[, 1], xout = ts, method = "natural")$y,
+                    y = spline(tt, bp[, 2], xout = ts, method = "natural")$y)
+## =============================================================================
+## 4. DRAW
+## =============================================================================
+pt <- ggplot2::.pt
+C_UP <- "#B2182B"; C_DN <- "#2166AC"
+C_CELL <- "#F9E9E1"; C_MEMB <- "#A0523A"
+fill_sc <- scale_fill_gradient2(low = C_DN, mid = "#F7F7F7", high = C_UP, midpoint = 0, limits = c(-CAP, CAP),
+                                oob = scales::squish, na.value = "grey85", guide = "none")
+arr  <- arrow(length = unit(0.9, "mm"), type = "closed")
+arr2 <- arrow(length = unit(1.3, "mm"), type = "closed")
+T <- function(x, y, label, size = 6, ...) annotate("text", x = x, y = y, label = label, size = size * TS / pt, family = FONT, ...)
+YMIN <- -21; YMAX <- H + YMIN
+p <- ggplot() + coord_fixed(xlim = c(0, W), ylim = c(YMIN, YMAX), expand = FALSE, clip = "off") +
+  theme_void(base_family = FONT) + theme(plot.margin = margin(0, 0, 0, 0), plot.background = element_rect(fill = "white", colour = NA))
+## organ icon + zoom
+p <- p +
+  geom_polygon(data = liver_icon, aes(x, y), fill = "#C8735A", colour = "#7E3420", linewidth = 0.4) +
+  geom_path(data = lig, aes(x, y), colour = "#7E3420", linewidth = 0.3) +
+  geom_polygon(data = gb_icon, aes(x, y), fill = "#9DB36A", colour = "#5C6E2A", linewidth = 0.3) +
+  annotate("rect", xmin = zoom[["x0"]], xmax = zoom[["x1"]], ymin = zoom[["y0"]], ymax = zoom[["y1"]],
+           fill = NA, colour = "black", linewidth = 0.35) +
+  annotate("segment", x = zoom[["x0"]], y = zoom[["y0"]], xend = CELL[["x0"]] + 1, yend = CELL[["y1"]],
+           colour = "grey45", linewidth = 0.25, linetype = "22") +
+  annotate("segment", x = zoom[["x1"]], y = zoom[["y0"]], xend = 60, yend = CELL[["y1"]],
+           colour = "grey45", linewidth = 0.25, linetype = "22") +
+  T(43, 168, "Liver", 8, hjust = 0, fontface = "bold", colour = "#6B2A18") +
+  T(43, 163.5, "biopsy: transcriptome, lipidome, polar metabolome", 5.4, hjust = 0, colour = "#6B2A18") +
+  T(mean(X_VES), 168, "Blood", 8, fontface = "bold", colour = "#8E2F36") +
+  T(mean(X_VES), 163.5, "serum polar metabolome", 5.4, colour = "#8E2F36")
+## sinusoid
+p <- p +
+  geom_polygon(data = rrect(X_VES[1], X_VES[2], 4, 156, r = 14, n = 20), aes(x, y), fill = "#F4CFCB", colour = "#B5424A", linewidth = 0.5) +
+  geom_polygon(data = rrect(X_VES[1] + 2.2, X_VES[2] - 2.2, 6.2, 153.8, r = 12, n = 20), aes(x, y), fill = "#FBEAE8", colour = NA) +
+  geom_polygon(data = bind_rows(lapply(seq_len(nrow(rbc)), \(k) ell(rbc$x[k], rbc$y[k], rbc$a[k], 2.6, 1.45) |> mutate(g = k))),
+               aes(x, y, group = g), fill = "#E39A98", colour = "#C9686A", linewidth = 0.15, alpha = 0.85) +
+  T(mean(X_VES), 152.2, "Sinusoid", 5.6, fontface = "italic", colour = "#8E2F36") +
+  annotate("segment", x = mean(X_VES), xend = mean(X_VES), y = 2, yend = -3.6, colour = "#B5424A", linewidth = 0.6, arrow = arr2) +
+  T(mean(X_VES), -6.2, "to systemic circulation", 5, colour = "#8E2F36")
+## space of Disse + fenestrated endothelium
+p <- p +
+  annotate("segment", x = 133, xend = 133, y = fenes$y0, yend = fenes$y1, colour = "#B5424A", linewidth = 0.45) +
+  T(135.6, 112, "fenestrated endothelium", 4.6, angle = 90, colour = "#8E2F36")
+## hepatocyte
+p <- p +
+  geom_polygon(data = rrect(CELL[["x0"]], CELL[["x1"]], CELL[["y0"]], CELL[["y1"]], r = 7, n = 14), aes(x, y),
+               fill = C_CELL, colour = C_MEMB, linewidth = 0.9) +
+  geom_polygon(data = rrect(CELL[["x0"]] + 0.9, CELL[["x1"]] - 0.9, CELL[["y0"]] + 0.9, CELL[["y1"]] - 0.9, r = 6.2, n = 14),
+               aes(x, y), fill = NA, colour = "#D79E89", linewidth = 0.3) +
+  T(CELL[["x1"]] - 1.5, CELL[["y1"]] + 1.8, "Sinusoidal (basolateral) membrane", 5, hjust = 1, colour = C_MEMB) +
+  T(9, CELL[["y1"]] + 2.2, "Hepatocyte", 6.5, hjust = 0, fontface = "bold", colour = "#6B2A18")
+## nucleus with the genetic instrument
+helix <- tibble(t = seq(0, 4 * pi, length.out = 120)) |>
+  mutate(x1 = nuc[["x"]] + 2.2 * sin(t), x2 = nuc[["x"]] - 2.2 * sin(t), y = nuc[["y"]] - 2 + t / (4 * pi) * 11)
+rungs <- helix[seq(5, 120, by = 8), ]
+p <- p +
+  geom_polygon(data = ell(nuc[["x"]], nuc[["y"]], 0, nuc[["rx"]], nuc[["ry"]]), aes(x, y), fill = "#E6DDF2", colour = "#6A58A0", linewidth = 0.45) +
+  geom_segment(data = rungs, aes(x = x1, xend = x2, y = y, yend = y), colour = "#B7AAD9", linewidth = 0.25) +
+  geom_path(data = helix, aes(x1, y), colour = "#4B3A8A", linewidth = 0.5) +
+  geom_path(data = helix, aes(x2, y), colour = "#8E7FC4", linewidth = 0.5) +
+  T(nuc[["x"]], nuc[["y"]] - 5.2, "Discordant\npPRS", 5.6, fontface = "bold", colour = "#3E3266", lineheight = 0.9) +
+  T(nuc[["x"]], nuc[["y"]] - 10.6, "genetic hepatic\nlipid retention", 4.7, colour = "#3E3266", lineheight = 0.9)
+## lipid droplets, mitochondria
+p <- p +
+  geom_polygon(data = bind_rows(lapply(seq_len(nrow(drops)), \(k) circ(drops$x[k], drops$y[k], drops$r[k]) |> mutate(g = k))),
+               aes(x, y, group = g), fill = "#F5DC86", colour = "#C8A43C", linewidth = 0.25) +
+  geom_polygon(data = bind_rows(lapply(seq_len(nrow(mito)), \(k) ell(mito$x[k], mito$y[k], mito$a[k], 3.6, 1.6) |> mutate(g = k))),
+               aes(x, y, group = g), fill = "#F2C9B4", colour = "#B9765C", linewidth = 0.25) +
+  T(17, 49.2, "lipid droplets", 4.8, colour = "#7A5A12") + T(16, 35, "mitochondria", 4.8, colour = "#8A4A32")
+## cards
+for (i in seq_len(nrow(CARD))) {
+  cd <- CARD[i, ]
+  p <- p + geom_polygon(data = rrect(cd$x0, cd$x1, cd$y0, cd$y1, r = 2.2), aes(x, y), fill = "white", alpha = 0.92,
+                        colour = "#D9A893", linewidth = 0.25) +
+    T(cd$x0 + 1.8, cd$y1 - 2.3, cd$title, 6.2, hjust = 0, fontface = "bold", colour = "grey15")
+}
+## pathways
+p <- p +
+  geom_segment(data = arrows, aes(x = xs, y = ys, xend = xe, yend = ye), linetype = arrows$lty,
+               linewidth = 0.28, colour = "grey25", arrow = arr) +
+  geom_text(data = TXT, aes(x, y, label = lab), family = FONT, size = 5.8 * TS / pt, lineheight = 0.88, colour = "grey10") +
+  geom_text(data = enz, aes(gx, gy, label = enz), family = FONT, fontface = "italic", size = EPT * TS / pt, hjust = 0) +
+  geom_tile(data = enz_t, aes(tx, gy, fill = v), width = TW, height = TH, colour = "white", linewidth = 0.12)
+## TDCA is a secondary bile acid (deoxycholate formed by gut bacteria, re-conjugated in the liver)
+a_tdca <- filter(arrows, to == "tdca")
+p <- p + T(a_tdca$mx - 3, a_tdca$my - 3.6, "via gut\nmicrobial DCA", 4.8, fontface = "italic", colour = "grey30", lineheight = 0.9)
+## bile export: conjugates -> canalicular membrane (ABCB11) -> bile canaliculus
+p <- p +
+  annotate("segment", x = 104, xend = 104, y = 37.5, yend = CELL[["y0"]] + 2.6, colour = "grey25", linewidth = 0.28, arrow = arr) +
+  annotate("segment", x = 104, xend = 104, y = CELL[["y0"]] - 2.4, yend = 4.2, colour = "#5C6E2A", linewidth = 0.4, arrow = arr) +
+  geom_polygon(data = rrect(70, 124, -1, 3.6, r = 2.3), aes(x, y), fill = "#DDE6BE", colour = "#5C6E2A", linewidth = 0.35) +
+  T(97, 1.3, "Bile canaliculus → bile, gallbladder", 5.2, colour = "#3F4D1A") +
+  T(70, CELL[["y0"]] + 1.7, "canalicular membrane", 4.8, hjust = 0, colour = C_MEMB)
+## exchange: liver node -> transporter -> serum node
+ex <- ser_nodes |> left_join(MET |> select(lab, lx = x), by = "lab")
+p <- p + geom_segment(data = filter(ex, !is.na(lx)), aes(x = lx + R + 1.2, xend = X_SER - R - 1.2, y = y, yend = y),
+                      colour = "grey55", linewidth = 0.25, linetype = "22")
+## transporters
+p <- p +
+  geom_polygon(data = bind_rows(lapply(seq_len(nrow(tr)), \(k) rrect(tr$gx[k] - 0.9, tr$gx[k] + tr$gw[k] + 0.7,
+                                                                     tr$y[k] - 1.9, tr$y[k] + 1.9, r = 1.9) |> mutate(g = k))),
+               aes(x, y, group = g), fill = "#F6E7DA", colour = C_MEMB, linewidth = 0.35) +
+  geom_text(data = tr, aes(gx, y, label = gene), family = FONT, fontface = "italic", size = EPT * TS / pt, hjust = 0) +
+  geom_tile(data = tr_t, aes(tx, y, fill = v), width = TW, height = TH, colour = "white", linewidth = 0.12)
+## metabolite circles
+p <- p +
+  geom_polygon(data = liv_h, aes(x, y, group = g, fill = v), colour = NA) +
+  geom_polygon(data = ser_h, aes(x, y, group = g, fill = v), colour = NA) +
+  geom_polygon(data = filter(bind_rows(liv_h, ser_h), !sig), aes(x, y, group = g), fill = NA, colour = "grey55", linewidth = 0.15) +
+  geom_polygon(data = filter(bind_rows(liv_h, ser_h), sig), aes(x, y, group = g), fill = NA, colour = "black", linewidth = 0.38) +
+  geom_text(data = MET, aes(x - R - 0.8, y, label = lab), family = FONT, size = 5.8 * TS / pt, hjust = 1, fontface = "bold") +
+  geom_text(data = ser_nodes, aes(X_SER + R + 1, y, label = lab), family = FONT, size = 5.8 * TS / pt, hjust = 0, fontface = "bold") +
+  geom_text(data = filter(ser_nodes, !is.na(which)), aes(X_SER + R + 2 + cw(lab, 5.8), y, label = paste0("Δ", which)),
+            family = FONT, size = 5.4 * TS / pt, hjust = 0) +
+  geom_text(data = filter(ser_nodes, !in_pair), aes(X_SER + R + 1, y, label = paste0(lab, " †")),
+            family = FONT, size = 5.8 * TS / pt, hjust = 0, fontface = "bold", colour = "black")
+## genetics: nucleus -> hepatic TG (up), nucleus -> serum TG (down)
+p <- p +
+  annotate("curve", x = nuc[["x"]] - 3, y = nuc[["y"]] - nuc[["ry"]] - 0.5, xend = 15, yend = 73 + R + 0.8,
+           curvature = 0.2, colour = C_UP, linewidth = 0.6, arrow = arr2) +
+  T(30.5, 99, sprintf("↑ hepatic TG\nβ = %s SD\n%s", fmt_b(b_liv$beta), fmt_p(b_liv$p)), 5, colour = C_UP,
+    lineheight = 0.92, hjust = 1) +
+  geom_path(data = blue_path, aes(x, y), colour = C_DN, linewidth = 0.6) +
+  annotate("segment", x = 16, xend = X_SER - R - 1, y = y_stg, yend = y_stg, colour = C_DN, linewidth = 0.6, arrow = arr2) +
+  T(66, y_stg + 2.4, sprintf("↓ serum TG   β = %s SD, %s", fmt_b(b_ser$beta), fmt_p(b_ser$p)), 5.2, colour = C_DN) +
+  annotate("point", x = X_SER, y = y_stg, shape = 21, size = 2 * R * 1.27, fill = "#DCE6F2", colour = C_DN, stroke = 0.5) +
+  T(X_SER + R + 1, y_stg + 0.4, "TG", 5.8, hjust = 0, fontface = "bold") +
+  T(X_SER + R + 1, y_stg - 3, "clinical", 4.8, hjust = 0, colour = "grey30")
+## legend
+lx <- 4; ly <- -10.5
+grad <- tibble(v = seq(-CAP, CAP, length.out = 31), x = lx + seq(0, 24, length.out = 31))
+leg_half <- bind_rows(half(lx + 41, ly, 2.4, "L") |> mutate(g = "a", v = 0.45), half(lx + 41, ly, 2.4, "R") |> mutate(g = "b", v = -0.45))
+leg_tile <- tibble(x = c(lx + 69, lx + 72.2), y = ly, v = c(0.35, -0.35))
+p <- p +
+  geom_tile(data = grad, aes(x, ly + 0.8, fill = v), width = 0.82, height = 2.2) +
+  T(lx, ly - 2.1, sprintf("≤−%.1f", CAP), 5, hjust = 0.3) + T(lx + 12, ly - 2.1, "0", 5) +
+  T(lx + 24, ly - 2.1, sprintf("≥%.1f", CAP), 5, hjust = 0.7) +
+  T(lx + 12, ly + 4, "Effect, grade ≥1 vs 0", 5.4, fontface = "bold") +
+  geom_polygon(data = leg_half, aes(x, y, group = g, fill = v), colour = "black", linewidth = 0.3) +
+  T(lx + 37.6, ly + 3.6, "S", 5.4, fontface = "bold") + T(lx + 44.4, ly + 3.6, "I", 5.4, fontface = "bold") +
+  T(lx + 45.4, ly - 0.2, "metabolite\nblack rim, FDR ≤ 0.10", 4.9, hjust = 0, lineheight = 0.9) +
+  geom_tile(data = leg_tile, aes(x, y, fill = v), width = TW, height = TH, colour = "white") +
+  T(lx + 67.7, ly + 3.4, "S   I", 5.4, hjust = 0, fontface = "bold") +
+  T(lx + 75, ly, "enzyme /\ntransporter", 4.9, hjust = 0, lineheight = 0.9) +
+  T(lx + 89, ly + 2.4, "ΔS,I  liver–serum discordant (paired model, FDR ≤ 0.10)", 5, hjust = 0) +
+  T(lx + 89, ly - 0.7, "†  not in the matched panel (separate liver and serum analyses)", 5, hjust = 0) +
+  T(lx + 89, ly - 3.8, "S, steatosis; I, lobular inflammation; grey, not significant / not DE", 5, hjust = 0, colour = "grey25") +
+  fill_sc
+## =============================================================================
+## 5. SAVE (vector + high-resolution raster) AND VALUE TABLE
+## =============================================================================
+f <- function(ext) file.path(OUT_DIR, paste0(STEM, ext))
+ggsave(f(".pdf"), p, width = W, height = H, units = "mm", device = cairo_pdf)
+ggsave(f(".png"), p, width = W, height = H, units = "mm", dpi = 600, bg = "white")
+ggsave(f(".tiff"), p, width = W, height = H, units = "mm", dpi = 600, bg = "white", compression = "lzw")
+```
+
+## Source Data Fig. 6
+
+```{r livertos-02, message=FALSE, warning=FALSE}
+write_source_data("Source Data Fig. 6.xlsx", list(
+  sd_panel("Fig. 6 genes", "Hepatic RNA-seq tiles: log2 fold change (v) and FDR (f) per gene and feature (ph).", gene),
+  sd_panel("Fig. 6 liver", "Hepatic metabolite circles: effect (v) and FDR (f).", liver),
+  sd_panel("Fig. 6 serum", "Serum metabolite circles: effect (v) and FDR (f).", serum),
+  sd_panel("Fig. 6 paired", "Matched-panel liver and serum effects (L, S), FDRs (Lf, Sf) and discordance (disc).", pair),
+  sd_panel("Fig. 6 TG", "Hepatic triglyceride species: median effect (v) and minimum FDR (f).", tg),
+  sd_panel("Fig. 6 pPRS", "Discordant pPRS associations with hepatic and serum TG.", prs)))
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Fig6_pathway_map")   # lets the next step start from here
+```
