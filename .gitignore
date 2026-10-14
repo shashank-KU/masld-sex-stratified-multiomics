@@ -1,10 +1,19 @@
-   data/*
-   !data/README.md
-   !data/Analyisis/
-   data/Analyisis/*
-   !data/Analyisis/Metadata.xlsx
-   !data/Transcriptomics/
-   data/Transcriptomics/*
-   !data/Transcriptomics/MAFALDA_STAR/
-   data/Transcriptomics/MAFALDA_STAR/*
-   !data/Transcriptomics/MAFALDA_STAR/genes.expected_count.txt
+# Input data: only the files listed here are tracked
+data/*
+!data/README.md
+!data/Analyisis/
+data/Analyisis/*
+!data/Analyisis/Metadata.xlsx
+
+# Results, caches and R session files
+results/*
+*.RData
+*.rds
+.Rhistory
+.Rproj.user/
+*.html
+
+# xlsx is ignored, except the summary-level Source Data
+*.xlsx
+!*/Source_data/*.xlsx
+!data/Analyisis/Metadata.xlsx
