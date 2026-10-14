@@ -1,0 +1,265 @@
+---
+title: "Table 1: cohort characteristics"
+author:
+  - name: "Shashank Gupta"
+    affiliation: "Örebro University"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+This script reproduces **Table 1: cohort characteristics**. It reuses the setup below; objects from earlier analyses may be required (see ../README.md for the run order), or knit `analysis/MASLD_main_manuscript_analysis.Rmd` as a whole. Source Data are written to `results/source_data/`.
+
+# 1. Setup
+
+Packages, paths, significance thresholds and helper functions. Inputs are read from `data/`; tables and figures are written to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE
+)
+
+# ---- Paths -------------------------------------------------------------
+# Raw input files are read from data/ (not included in the repository, see data/README.md) and everything
+# that is written goes to results/. Both are resolved once, to absolute paths, in this order:
+#   1. environment variable MASLD_DATA_DIR / MASLD_RESULTS_DIR
+#   2. ../data and ../results (this file lives in analysis/), or data/ and results/ in the working directory
+.cands <- c(Sys.getenv("MASLD_DATA_DIR", unset = NA), "../data", "data")
+.cands <- .cands[!is.na(.cands) & nzchar(.cands)]
+.hit <- .cands[dir.exists(.cands)]
+if (!length(.hit)) stop("Input folder not found. Set it first, e.g.\n  Sys.setenv(MASLD_DATA_DIR = \"/path/to/folder/with/Analyisis\")")
+project_dir <- normalizePath(.hit[1])
+.res <- Sys.getenv("MASLD_RESULTS_DIR",
+                   unset = if (basename(project_dir) == "data") file.path(dirname(project_dir), "results") else file.path(project_dir, "results"))
+dir.create(file.path(.res, "tables"), showWarnings = FALSE, recursive = TRUE)
+results_dir <- normalizePath(.res)
+OUT_DIR <- results_dir                           # used by the Table 1 chunk
+knitr::opts_knit$set(root.dir = results_dir)     # relative output paths land in results/
+setwd(results_dir)                               # same when run chunk by chunk in the console
+message("Input folder:  ", project_dir, "\nResults folder: ", results_dir)
+
+# Supplementary Tables workbook (published with the paper); only used to read Table S3 (curated lipid names)
+# and to compare column names of the tables written below.
+SUPP_XLSX <- Sys.getenv("MASLD_SUPP_XLSX", unset = file.path(project_dir, "gupta_MASLD_SupplementaryTables.xlsx"))
+
+# ---- Significance thresholds (Benjamini-Hochberg FDR) -------------------
+FDR_GENE  <- 0.05   # DESeq2 genes (Table S1, Figs 1, 3, 6) and external replication (Tables S5-S7)
+FDR_OMICS <- 0.10   # limma lipids and metabolites (Tables S3, S4, S10a, S10b, S11, S12, S19, S20)
+FDR_KEGG  <- 0.10   # KEGG enrichment, at least 3 genes (Table S2b, Table S7)
+
+# ---- Supplementary tables are collected in manuscript order ---------------
+SUPP <- list()
+add_table <- function(name, x) {
+  SUPP[[name]] <<- x
+  if (is.data.frame(x)) {
+    write.csv(x, file.path(results_dir, "tables", paste0(gsub(" ", "_", name), ".csv")), row.names = FALSE)
+  } else for (lab in names(x)) if (is.data.frame(x[[lab]]))
+    write.csv(x[[lab]], file.path(results_dir, "tables", paste0(gsub(" ", "_", name), "_", gsub("[^A-Za-z0-9]+", "_", lab), ".csv")), row.names = FALSE)
+  invisible(x)
+}
+
+# Source Data workbooks (Nature style: one sheet per figure panel) -> results/source_data/
+sd_panel <- function(name, desc, data) list(name = name, desc = desc, data = as.data.frame(data))
+write_source_data <- function(file, panels) {
+  dir.create(file.path(results_dir, "source_data"), showWarnings = FALSE, recursive = TRUE)
+  wb <- openxlsx::createWorkbook()
+  for (p in panels) {
+    sh <- substr(p$name, 1, 31)
+    openxlsx::addWorksheet(wb, sh)
+    openxlsx::writeData(wb, sh, p$desc, startRow = 1)
+    openxlsx::writeData(wb, sh, p$data, startRow = 3)
+  }
+  openxlsx::saveWorkbook(wb, file.path(results_dir, "source_data", file), overwrite = TRUE)
+  message("Wrote source data: ", file)
+}
+
+# dotplot of an enrichment result; returns NULL (instead of an error) when nothing is enriched
+safe_dotplot <- function(x, ...) {
+  if (is.null(x) || nrow(as.data.frame(x)) == 0) return(invisible(NULL))
+  enrichplot::dotplot(x, ...)
+}
+```
+
+```{r setup-02, warning=FALSE, message=FALSE, results='hide'}
+# Load necessary libraries for data manipulation and visualization
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(gtsummary)
+library(ggplot2)
+library(tidyverse)
+library(RColorBrewer)
+library(POMA)
+library(ggtext)
+library(magrittr)
+library(tibble)
+library(cowplot)
+library(patchwork)
+library(ggpubr)
+library(ggstatsplot)
+library(mediation)
+library(limma)
+library(ggcorrplot)
+library(stats)
+library(corrplot)
+library(GO.db)
+library(GenomicFeatures)
+library(AnnotationDbi)
+library(DESeq2)
+library(dbplyr)
+library(dplyr)
+library(readr)
+library(gridExtra)
+library(grid)
+library(stringr)
+theme_set(theme_bw())
+```
+
+
+# 2. Cohort: Table 1
+
+Participant characteristics of the 211 adults.
+
+```{r cohort-01}
+phenotype <- data.frame(readxl::read_excel(file.path(project_dir, "Analyisis/Metadata.xlsx")))
+rownames(phenotype) <- phenotype$id
+phenotype <- phenotype[,-1]
+phenotype <- phenotype %>%
+  rename(
+    Age = Age_yr, BMI = BMI_kgm2, Menopause = Menopause_YN,
+    Glucose = Glucose_mgdL, HbA1c = HbA1c_percent,
+    AST = AST_UL, ALT = ALT_UL, GGT = GGT_UL,
+    Cholesterol = Cholesterol_mgdL, HDL = HDL_mgdL, LDL = LDL_mgdL,
+    TG = TG_mgdL,
+    Steatosis = steatosis_Kleiner, Inflammation = inflammation_Kleiner,
+    MASH = NASH_Kleiner_YN, Fibrosis = fibrosis_Kleiner_04,
+    Gender = Gender_M0F1
+  )
+# --------------------------------------------------------- sex decode ------
+# Gender_M0F1 is named as though numeric but holds "Male"/"Female" strings.
+# Handle either, then verify before using.
+decode_sex <- function(x) {
+  if (is.numeric(x)) {
+    ifelse(x == 0, "Male", "Female")
+  } else {
+    ifelse(grepl("^m", as.character(x), ignore.case = TRUE), "Male", "Female")
+  }
+}
+phenotype$Sex <- factor(decode_sex(phenotype$Gender),
+                        levels = c("Female", "Male"))
+if (!setequal(as.integer(table(phenotype$Sex)), c(57L, 154L)))
+  stop("Sex decode failed - expected 57 men / 154 women.")
+.prev <- tapply(as.integer(phenotype$Steatosis != 0), phenotype$Sex, mean)
+if (names(which.max(.prev)) != "Male")
+  stop("Sex labels are inverted - men should have the higher steatosis prevalence.")
+message("Sex decode verified: 154 women, 57 men.")
+# ------------------------------------------------------------ recode -------
+cat("\nRaw coding check — confirm before trusting the labels below:\n")
+for (v in c("Steatosis", "Inflammation", "Fibrosis", "MASH", "Menopause")) {
+  cat(sprintf("  %-13s ", v)); print(table(phenotype[[v]], useNA = "ifany"))
+}
+phenotype <- phenotype %>%
+  mutate(
+    Steatosis_grade = factor(Steatosis, levels = 0:3,
+      labels = c("Grade 0", "Grade 1",
+                 "Grade 2", "Grade 3")),
+    Inflammation_grade = factor(Inflammation, levels = 0:3,
+      labels = c("Grade 0", "Grade 1",
+                 "Grade 2", "Grade 3")),
+    Fibrosis_stage = factor(Fibrosis, levels = 0:4,
+      labels = c("Stage 0", "Stage 1", "Stage 2",
+                 "Stage 3", "Stage 4")),
+    Steatosis_bin    = factor(ifelse(Steatosis    == 0, "No", "Yes"),
+                              levels = c("No", "Yes")),
+    Inflammation_bin = factor(ifelse(Inflammation == 0, "No", "Yes"),
+                              levels = c("No", "Yes")),
+    Fibrosis_bin     = factor(ifelse(Fibrosis     == 0, "No", "Yes"),
+                              levels = c("No", "Yes")),
+    # Edit if MASH is coded other than 0/1
+    MASH_lab = factor(ifelse(MASH == 1, "Yes", "No"), levels = c("No", "Yes"))
+  ) %>%
+  mutate(across(where(is.factor), droplevels))
+# ------------------------------------------------------------- table -------
+table1 <- tbl_summary(
+  phenotype,
+  by = Sex,
+  include = c(Age, BMI, Glucose, HbA1c, AST, ALT, GGT,
+              Cholesterol, HDL, LDL, TG,
+              Steatosis_grade, Inflammation_grade, Fibrosis_stage, MASH_lab,
+              Steatosis_bin, Inflammation_bin, Fibrosis_bin),
+  label = list(
+    Age                ~ "Age, years",
+    BMI                ~ "Body mass index, kg/m\u00b2",
+    Glucose            ~ "Fasting glucose, mg/dL",
+    HbA1c              ~ "HbA1c, %",
+    AST                ~ "AST, U/L",
+    ALT                ~ "ALT, U/L",
+    GGT                ~ "GGT, U/L",
+    Cholesterol        ~ "Total cholesterol, mg/dL",
+    HDL                ~ "HDL cholesterol, mg/dL",
+    LDL                ~ "LDL cholesterol, mg/dL",
+    TG                 ~ "Triglycerides, mg/dL",
+    Steatosis_grade    ~ "Hepatic steatosis grade",
+    Inflammation_grade ~ "Lobular inflammation grade",
+    Fibrosis_stage     ~ "Fibrosis stage",
+    MASH_lab           ~ "Histologically definite MASH",
+    Steatosis_bin      ~ "Steatosis \u2265 grade 1",
+    Inflammation_bin   ~ "Lobular inflammation \u2265 grade 1",
+    Fibrosis_bin       ~ "Fibrosis \u2265 stage 1"
+  ),
+  statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                   all_categorical() ~ "{n} ({p}%)"),
+  digits = list(all_continuous() ~ 1),
+  missing_text = "Missing"
+) %>%
+  add_n() %>%
+  add_overall(col_label = "**All participants**  \nN = {N}") %>%
+  add_p(test = list(all_continuous()  ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test")) %>%
+  modify_header(label = "**Characteristic**") %>%
+  bold_labels()
+table1
+# ------------------------------------------------------------- export ------
+caption <- paste(
+  "Table 1. Clinical, biochemical and histological characteristics of the",
+  "study cohort, by sex."
+)
+footnotes <- c(
+  "Continuous variables are median (Q1, Q3); categorical variables are n (%).",
+  paste("P values from the Wilcoxon rank-sum test (continuous) and Pearson's",
+        "chi-squared test (categorical); not adjusted for multiple comparisons."),
+  paste("Histological features were graded on liver biopsy using the Kleiner",
+        "scoring system. Steatosis, lobular inflammation and fibrosis were",
+        "dichotomised (grade/stage 0 vs \u2265 1) for all downstream analyses."),
+  paste("Of 154 women, 119 (77%) were pre-menopausal and 35 (23%)",
+        "post-menopausal; menopausal status is not applicable to men and is",
+        "therefore not tabulated."),
+  "AST, aspartate aminotransferase; ALT, alanine aminotransferase; GGT, gamma-glutamyl transferase; MASH, metabolic dysfunction-associated steatohepatitis."
+)
+if (requireNamespace("flextable", quietly = TRUE)) {
+  ft <- gtsummary::as_flex_table(table1)
+  ft <- flextable::set_caption(ft, caption)
+  for (f in rev(footnotes)) {
+    ft <- flextable::add_footer_lines(ft, values = f)
+  }
+  ft <- flextable::fontsize(ft, size = 9, part = "all")
+  ft <- flextable::fontsize(ft, size = 8, part = "footer")
+  ft <- flextable::font(ft, fontname = "Arial", part = "all")
+  ft <- flextable::autofit(ft)
+  flextable::save_as_docx(ft, path = file.path(OUT_DIR, "Table1.docx"))
+  flextable::save_as_html(ft, path = file.path(OUT_DIR, "Table1.html"))
+  message("Wrote Table1.docx and Table1.html")
+} else {
+  message("flextable not installed - install.packages('flextable') for .docx output")
+}
+readr_ok <- requireNamespace("readr", quietly = TRUE)
+tbl_df <- gtsummary::as_tibble(table1)
+utils::write.csv(tbl_df, "Table1.csv", row.names = FALSE)
+message("Wrote Table1.csv")
+phenotype <- data.frame(readxl::read_excel(file.path(project_dir, "Analyisis/Metadata.xlsx")))
+rownames(phenotype) <- phenotype$id
+phenotype <- phenotype[,-1]
+```
+
