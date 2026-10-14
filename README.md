@@ -15,7 +15,6 @@ Code for <b>"Matched liver–serum multi-omics and genetic risk reveal hepatic c
 Liver transcriptome, lipidome and polar metabolome, serum metabolome and partitioned polygenic risk scores in 211 MAFALDA participants, with external validation in three public cohorts.
 </p>
 
-> **Scope.** This repository contains analysis code, Supplementary Tables and per-figure Source Data scripts. Individual-level clinical and omics data are **not** included (consent does not cover public release).
 
 ---
 
