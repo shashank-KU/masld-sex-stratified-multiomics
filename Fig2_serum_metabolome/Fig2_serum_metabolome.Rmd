@@ -1,0 +1,422 @@
+---
+title: "Fig. 2: serum metabolome (Table S10a)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Fig2_serum_metabolome.Rmd")` from this folder). It first loads the workspace of the previous step (`Hepatic_polar_metabolome`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Hepatic_polar_metabolome")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Fig2_serum_metabolome")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Serum metabolome: Table S10a and Fig. 2
+
+Serum polar and semi-polar metabolomics (n = 209), and the Sankey diagram of liver and serum metabolites (Fig. 2).
+
+#### Read Input Data and Subsetting Based on Gender for Downstream Analysis
+
+```{r serummet-01, message=FALSE, warning=FALSE, error=FALSE}
+# Load description data
+# Read the description data
+exposures <- data.frame(readxl::read_excel(file.path(project_dir, "Analysis_Serum_Polars_Semipolars/exposure_serum_polars_semipolars.xlsx")))
+exposures <- t(exposures)
+exposures <- data.frame(exposures)
+colnames(exposures) <- exposures[1, ]
+exposures <- exposures[-1, ]
+clean_colnames <- function(colnames) {
+  gsub("[^[:alnum:]_]", "_", colnames)
+}
+# Apply the function to the column names
+colnames(exposures) <- clean_colnames(colnames(exposures))
+clean_colnames <- function(colnames) {
+  colnames <- gsub("___", "_", colnames)  # Replace triple underscores with single underscore
+  colnames <- gsub("__", "_", colnames)   # Replace double underscores with single underscore
+  return(colnames)
+}
+# Apply the function to the column names
+colnames(exposures) <- clean_colnames(colnames(exposures))
+phenotype_Serum <- data.frame(readxl::read_excel(file.path(project_dir, "Analysis_Serum_Polars_Semipolars/Metadata_serum.xlsx")))
+row.names(phenotype_Serum) <- phenotype_Serum$ID
+phenotype_Serum <- phenotype_Serum %>%
+  filter(!is.na(steatosis_Kleiner))
+# Find common row names
+common_rows <- intersect(rownames(exposures), rownames(phenotype_Serum))
+# Subset exposures to keep only common rows
+phenotype_Serum_PolarSemipolars <- phenotype_Serum[common_rows, , drop = FALSE]
+# Subset exposures data based on the filtered phenotype data frames
+exposures <- exposures[rownames(phenotype_Serum_PolarSemipolars), , drop = FALSE]
+# Ensure row names are aligned for both phenotype and exposures subsets
+phenotype_Serum_PolarSemipolars <- phenotype_Serum_PolarSemipolars[rownames(exposures), , drop = FALSE]
+# Validate alignment
+table(row.names(exposures) == row.names(phenotype_Serum_PolarSemipolars))
+pfas_cols <- c("PFHxS", "PFNA", "PFOA", "PFOS_L", "PFOS_B")
+exposures <- exposures[, !(colnames(exposures) %in% pfas_cols)]
+# Clean phenotype data
+phenotype_Serum_PolarSemipolars$Menopause_YN <- NULL
+phenotype_Serum_PolarSemipolars <- phenotype_Serum_PolarSemipolars[, -((ncol(phenotype_Serum_PolarSemipolars)-9):ncol(phenotype_Serum_PolarSemipolars))]
+subset_ids <- sub("LIV", "", rownames(phenotype))
+phenotype_Serum_PolarSemipolars <- phenotype_Serum_PolarSemipolars[phenotype_Serum_PolarSemipolars$ID %in% subset_ids, ]
+exposures <- exposures[rownames(exposures) %in% subset_ids, ]
+table(row.names(exposures) == row.names(phenotype_Serum_PolarSemipolars))
+# Convert rownames to a column in the phenotype data frame
+df <- tibble::rownames_to_column(phenotype_Serum_PolarSemipolars, "SampleID")
+min_value_GGT_UL <- min(df$GGT_UL, na.rm = TRUE)
+df$GGT_UL[is.na(df$GGT_UL)] <- min_value_GGT_UL / 2
+```
+
+#### Data Normalization and Visualization
+
+```{r serummet-02, fig.align='center', fig.height=8, fig.width=12}
+# Create a POMA object
+data <- POMA::PomaCreateObject(metadata = df, features = exposures)
+# Impute missing data using half-minimum method
+imputed <- data %>%
+  PomaImpute(method = "half_min", zeros_as_na = TRUE, remove_na = TRUE, cutoff = 20)
+log2_transformed <- imputed %>%
+    PomaNorm(method = "log_transform")
+# Normalize the data using log scaling
+normalized <- log2_transformed %>%
+  PomaNorm(method = "auto_scaling")
+# Create boxplots for visualization before and after normalization
+a <- PomaBoxplots(imputed, x = "samples") +
+     ggplot2::ggtitle("Not Normalized") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank()) + theme(legend.position="none")
+b <- PomaBoxplots(log2_transformed, x = "samples") +
+     ggplot2::ggtitle("Log transformed") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank()) +  theme(legend.position="none")
+c <- PomaBoxplots(normalized, x = "samples") +
+    ggplot2::ggtitle("Auto scaling") +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank()) + theme(legend.position="none")
+# Combine the plots for comparison
+#a + b + c
+b + c
+```
+
+```{r serummet-03, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.width=16}
+# Convert normalized data to a data frame
+exposures_Normalized <- as.data.frame(normalized@assays@data@listData)
+# Perform hierarchical clustering to detect outliers in metabolites
+sampleTree <- hclust(dist(t(exposures_Normalized)), method = "average")
+plot(sampleTree, main = "Polars and Semipolars: Clustering to Detect Outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+exposures_Normalized <- exposures_Normalized[, !names(exposures_Normalized) %in% "MF138"]
+# Perform hierarchical clustering to detect outliers in metabolites
+sampleTree <- hclust(dist(t(exposures_Normalized)), method = "average")
+plot(sampleTree, main = "Polars and Semipolars: Clustering to Detect Outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+## Prepare covariates and orientation for limma (serum)
+
+```{r serummet-04, message=FALSE, warning=FALSE}
+# sample MF138 was removed from the expression matrix above; drop it from the covariates too
+phenotype_Serum_PolarSemipolars <- phenotype_Serum_PolarSemipolars[rownames(phenotype_Serum_PolarSemipolars) != "MF138", ]
+exposures_Normalized <- t(exposures_Normalized)   # samples x metabolites
+df <- phenotype_Serum_PolarSemipolars
+df$ID <- NULL; df$ID_RM <- NULL
+df$Gender_M0F1 <- ifelse(df$Gender_M0F1 == "Male", 0, 1)
+df$Steatosis <- ifelse(df$steatosis_Kleiner == 0, 0, 1)
+df$Inflammation <- ifelse(df$inflammation_Kleiner == 0, 0, 1)
+df$Fibrosis <- ifelse(df$fibrosis_Kleiner_04 == 0, 0, 1)
+df$steatosis_Kleiner <- NULL; df$inflammation_Kleiner <- NULL; df$ballooning_Kleiner <- NULL
+df$NASH_Kleiner_YN <- NULL; df$fibrosis_Kleiner_04 <- NULL; df$NAS_score <- NULL
+df <- df %>% dplyr::rename(Age = Age_yr, Gender = Gender_M0F1, BMI = BMI_kgm2, Glucose = Glucose_mgdL,
+  HbA1c = HbA1c_percent, AST = AST_UL, ALT = ALT_UL, GGT = GGT_UL, Cholesterol = Cholesterol_mgdL,
+  HDL = HDL_mgdL, LDL = LDL_mgdL, Triglycerides = TG_mgdL)
+```
+
+#### DEGs Metabolomics
+
+```{r serummet-05}
+# Transpose matrix: rows = metabolites, columns = samples
+metabo_mat <- t(as.matrix(exposures_Normalized))
+# Check dimensions
+dim(metabo_mat)
+# Should be: features x samples, e.g., 701 x 189
+# Ensure column names match metadata rownames
+all(colnames(metabo_mat) == rownames(df))  # should be TRUE
+# Phenotype metadata
+metadata <- df
+metadata$Steatosis <- factor(metadata$Steatosis, levels = c(0,1))
+metadata$Inflammation <- factor(metadata$Inflammation, levels = c(0,1))
+metadata$Fibrosis <- factor(metadata$Fibrosis, levels = c(0,1))
+metadata$Gender <- factor(metadata$Gender, levels = c(0,1))  # 0 = Male, 1 = Female
+# Differential analysis function
+run_diff <- function(phenotype){
+  design <- model.matrix(~ Age + BMI + Gender + metadata[[phenotype]], data = metadata)
+
+  fit <- lmFit(metabo_mat, design)
+  fit <- eBayes(fit)
+
+  # Coefficient of interest = last column (phenotype effect)
+  coef_name <- ncol(design)
+  res <- topTable(fit, coef = coef_name, number = Inf, adjust.method = "fdr")
+  return(res)
+}
+# Run for each phenotype
+res_steatosis <- run_diff("Steatosis")
+res_inflammation <- run_diff("Inflammation")
+res_fibrosis <- run_diff("Fibrosis")
+# Filter significant metabolites (FDR ≤ 0.10)
+sig_steatosis <- res_steatosis[res_steatosis$adj.P.Val <= 0.1, ]
+sig_inflammation <- res_inflammation[res_inflammation$adj.P.Val <= 0.1, ]
+sig_fibrosis <- res_fibrosis[res_fibrosis$adj.P.Val <= 0.1, ]
+# Add phenotype and direction columns for each condition
+sig_steatosis_tbl_serum <- sig_steatosis %>%
+  mutate(Phenotype = "Steatosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_steatosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_inflammation_tbl_serum <- sig_inflammation %>%
+  mutate(Phenotype = "Inflammation",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_inflammation)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_fibrosis_tbl_serum <- sig_fibrosis %>%
+  mutate(Phenotype = "Fibrosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_fibrosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+# Combine all into a single table
+combined_sig_tbl_serum <- bind_rows(sig_steatosis_tbl_serum, sig_inflammation_tbl_serum)
+# Optional: sort by Phenotype and logFC
+combined_sig_tbl_serum <- combined_sig_tbl_serum %>%
+  arrange(Phenotype, desc(logFC))
+combined_sig_tbl_serum$Tissue <- "Serum"
+# View table
+```
+
+```{r serummet-06, message=FALSE, warning=FALSE}
+# keep the serum limma results for the EPoS comparison (Tables S19-S20)
+serum_limma <- list(Steatosis = res_steatosis, Inflammation = res_inflammation, Fibrosis = res_fibrosis)
+```
+
+## Table S10a
+
+```{r serummet-07, message=FALSE, warning=FALSE}
+add_table("Table S10a", combined_sig_tbl_serum %>% dplyr::select(-dplyr::any_of("Tissue")))
+```
+
+```{r serummet-08}
+library(ggalluvial)
+# 1️⃣ Read / define your serum and biopsy significant metabolite tables
+# Example: combined_sig_tbl_serum and combined_sig_tbl_biopsy
+# These should have at least: Metabolite, Phenotype, Direction, Tissue
+# Here we assume you already have them as data frames
+# 2️⃣ Combine serum and biopsy tables
+combined_sig_tbl <- bind_rows(combined_sig_tbl_serum, combined_sig_tbl_biospy)
+# 1️⃣ Clean metabolite names
+combined_sig_tbl <- combined_sig_tbl %>%
+  mutate(
+    Metabolite = gsub("\\.\\.\\..*", "", Metabolite), # remove ...1 suffixes
+    Metabolite = toupper(trimws(Metabolite))          # uppercase and trim spaces
+  )
+# 2️⃣ Create metabolite-to-pathway mapping
+metabolite_pathway_map <- data.frame(
+  Metabolite = c(
+    # Amino acids
+    "ISOLEUCINE", "LEUCIN", "GLUTAMINE", "GLUTAMIC_ACID",
+    "TRYPTOPHAN", "TAURINE", "METHIONINE", "PHENYLALANINE",
+    "VALINE", "THREONINE", "ASPARTIC_ACID", "LYSINE",
+    "SERINE", "AMINOBUTYRIC_ACID", "X3_METHYL_2_OXOVALERATE",
+
+    # Fatty acids / PUFA
+    "ARACHIDONIC_ACID", "CIS_8_11_14_17_EICOSATETRAENOIC_ACID", "HDCA",
+
+    # Bile acids
+    "ALLO_DCA", "GCA", "TCA", "TDCA",
+
+    # Nucleotides
+    "INOSINE", "HYPOXANTHINE",
+
+    # Carbohydrates / other
+    "MANNOSE_MYOINOSITOL", "QUINATE", "GALACTURONIC_ACID",
+
+    # Ketone bodies
+    "X2_HYDROXYBUTYRIC_ACID_3_HYDROXYBUTYRIC_ACID",
+
+    # Other / putative metabolites will be annotated as "Other" later
+    "PUTATIVE_OXYPURINOL", "PUTATIVE_CINNAMIC_ACID",
+    "PUTATIVE_TYROSOL_GLUCURONIDE_TYR_G",
+    "PUTATIVE_N_2_HYDROXYPHENYL_ACETAMIDE_SULFATE_2_HPA_S",
+    "PUTATIVE_P_COUMARIC_ACID_SULFATE_P_COU_S"
+  ),
+  Pathway = c(
+    # Amino acids
+    rep("Amino acid metabolism", 15),
+    # Fatty acids
+    rep("Fatty acid metabolism", 3),
+    # Bile acids
+    rep("Bile acid metabolism", 4),
+    # Nucleotides
+    rep("Nucleotide metabolism", 2),
+    # Carbohydrates / other
+    rep("Carbohydrate metabolism", 3),
+    # Ketone bodies
+    "Ketone metabolism",
+    # Putative / other
+    rep("Other", 5)
+  ),
+  stringsAsFactors = FALSE
+)
+# 3️⃣ Left join with main table and assign "Other" to unknowns
+combined_sig_tbl <- combined_sig_tbl %>%
+  left_join(metabolite_pathway_map, by = "Metabolite") %>%
+  mutate(Pathway = ifelse(is.na(Pathway), "Other", Pathway))
+# 4️⃣ Verify
+table(combined_sig_tbl$Pathway)
+# 2️⃣ Sankey input for Panel B
+sankey_data <- combined_sig_tbl %>%
+    filter(Pathway != "Other") %>%
+    group_by(Tissue, Phenotype, Direction, Pathway) %>%
+    summarise(Count = n_distinct(Metabolite), .groups = "drop")
+sankey_data$Tissue <- factor(sankey_data$Tissue, levels = c("Biopsy", "Serum"))
+sankey_data$Phenotype <- factor(sankey_data$Phenotype, levels = c("Inflammation", "Steatosis"))
+sankey_data$Direction <- factor(sankey_data$Direction, levels = c("Up", "Down"))
+sankey_data$Pathway <- factor(sankey_data$Pathway, levels = c(
+    "Amino acid metabolism",
+    "Fatty acid metabolism",
+    "Bile acid metabolism",
+    "Nucleotide metabolism",
+    "Carbohydrate metabolism",
+    "Ketone metabolism"
+))
+final_sankey <- ggplot(
+    sankey_data,
+    aes(
+        axis1 = Tissue,
+        axis2 = Phenotype,
+        axis3 = Direction,
+        axis4 = Pathway,
+        y = Count
+    )
+) +
+    geom_alluvium(aes(fill = Direction), width = 0.15, alpha = 0.8, color = "gray40") +
+    geom_stratum(width = 0.25, fill = "grey95", color = "black") +
+    geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3.5) +
+    scale_fill_manual(values = c("Up" = "#FFA500", "Down" = "#4575B4")) +
+    scale_x_discrete(labels = c("Tissue", "Phenotype", "Direction", "Pathway")) +
+    labs(
+        title = "Metabolite Regulation Across MASLD Features",
+        y = "Number of Metabolites",
+        x = NULL,
+        fill = "Direction"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+        axis.text.y = element_text(),
+        axis.ticks.y = element_line(),
+        panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 0, hjust = 0.5, face = "bold"),
+        plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+# 4️⃣ Show plot
+final_sankey
+```
+
+```{r serummet-09}
+# ---- Prepare Sankey data ----
+sankey_data <- combined_sig_tbl %>%
+  filter(Pathway != "Other") %>%
+  group_by(Tissue, Phenotype, Direction, Pathway) %>%
+  summarise(Count = n_distinct(Metabolite), .groups = "drop")
+# ---- Factor ordering ----
+sankey_data$Tissue <- factor(sankey_data$Tissue, levels = c("Biopsy", "Serum"))
+sankey_data$Phenotype <- factor(sankey_data$Phenotype, levels = c("Steatosis", "Inflammation"))
+sankey_data$Direction <- factor(sankey_data$Direction, levels = c("Up", "Down"))
+sankey_data$Pathway <- factor(
+  sankey_data$Pathway,
+  levels = c(
+    "Amino acid metabolism",
+    "Fatty acid metabolism",
+    "Bile acid metabolism",
+    "Carbohydrate metabolism",
+    "Ketone metabolism",
+    "Nucleotide metabolism"
+  )
+)
+# ---- Wrapped labels for pathways ----
+sankey_data$Pathway_wrapped <- str_wrap(as.character(sankey_data$Pathway), width = 16)
+# ---- Final Sankey plot ----
+final_sankey <- ggplot(
+  sankey_data,
+  aes(
+    axis1 = Tissue,
+    axis2 = Phenotype,
+    axis3 = Pathway_wrapped,
+    y = Count
+  )
+) +
+  geom_alluvium(
+    aes(fill = Direction),
+    width = 0.12,
+    alpha = 0.85,
+    color = "grey40"
+  ) +
+  geom_stratum(
+    width = 0.38,
+    fill = "grey95",
+    color = "black"
+  ) +
+  geom_text(
+    stat = "stratum",
+    aes(label = after_stat(stratum)),
+    size = 3.0,
+    fontface = "bold",
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(
+    values = c("Up" = "#FFA500", "Down" = "#4575B4"),
+    guide = guide_legend(title = "Regulation")
+  ) +
+  scale_x_discrete(
+    labels = c("Tissue", "Phenotype", "Pathway")
+  ) +
+  labs(
+    y = "Number of metabolites",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text.x = element_text(face = "bold"),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    plot.margin = margin(5, 25, 5, 25)
+  )
+# ---- Render ----
+final_sankey
+```
+
+## Source Data Fig. 2
+
+```{r serummet-10, message=FALSE, warning=FALSE}
+write_source_data("Source Data Fig. 2.xlsx", list(
+  sd_panel("Fig. 2 streams", "Number of unique metabolites per tissue, feature, direction and pathway class (stream widths).", sankey_data),
+  sd_panel("Fig. 2 metabolites", "Metabolites associated with steatosis or lobular inflammation (FDR <= 0.10; limma adjusted for age, sex and BMI) with pathway class; Biopsy = liver.",
+           combined_sig_tbl %>% dplyr::select(dplyr::any_of(c("Tissue", "Phenotype", "Metabolite", "Pathway", "Direction", "logFC", "AveExpr", "t", "P.Value", "adj.P.Val"))))))
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Fig2_serum_metabolome")   # lets the next step start from here
+```
