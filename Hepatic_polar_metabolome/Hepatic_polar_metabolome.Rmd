@@ -1,0 +1,187 @@
+---
+title: "Hepatic polar metabolome (Table S4)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Hepatic_polar_metabolome.Rmd")` from this folder). It first loads the workspace of the previous step (`Hepatic_lipidome`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Hepatic_lipidome")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Hepatic_polar_metabolome")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Hepatic polar metabolome: Table S4
+
+Liver polar and semi-polar metabolomics (n = 189), same workflow as the lipidome.
+
+#### Read Input Data and Subsetting Based on Gender for Downstream Analysis
+
+```{r hepaticp-01, message=FALSE, warning=FALSE, error=FALSE}
+# Load description data
+# Read the description data
+exposures <- data.frame(readxl::read_excel(file.path(project_dir, "Analysis_Polars_Semipolars/exposure_polars_semipolars.xlsx")))
+names(exposures) <- gsub("^X", "", names(exposures))
+rownames(exposures) <- exposures$id
+exposures$id <- NULL
+# Find common row names
+common_rows <- intersect(rownames(exposures), rownames(phenotype))
+# Subset exposures to keep only common rows
+phenotype_PolarSemipolars <- phenotype[common_rows, , drop = FALSE]
+# Subset exposures data based on the filtered phenotype data frames
+exposures <- exposures[rownames(phenotype_PolarSemipolars), , drop = FALSE]
+# Ensure row names are aligned for both phenotype and exposures subsets
+phenotype_PolarSemipolars <- phenotype_PolarSemipolars[rownames(exposures), , drop = FALSE]
+metabolomics_exposures <- exposures
+# Validate alignment
+table(row.names(exposures) == row.names(phenotype_PolarSemipolars))
+# Clean phenotype data
+phenotype_PolarSemipolars$Menopause_YN <- NULL
+# Convert rownames to a column in the phenotype data frame
+df <- tibble::rownames_to_column(phenotype_PolarSemipolars, "SampleID")
+min_value_GGT_UL <- min(df$GGT_UL, na.rm = TRUE)
+df$GGT_UL[is.na(df$GGT_UL)] <- min_value_GGT_UL / 2
+```
+
+#### Data Normalization and Visualization
+
+```{r hepaticp-02, fig.align='center', fig.height=8, fig.width=12}
+# Create a POMA object
+data <- POMA::PomaCreateObject(metadata = df, features = exposures)
+# Impute missing data using the half-minimum method
+imputed <- data %>%
+  POMA::PomaImpute(method = "half_min", zeros_as_na = TRUE, remove_na = TRUE, cutoff = 99)
+log2_transformed <- imputed %>%
+    PomaNorm(method = "log_transform")
+# Normalize the data using log scaling
+normalized <- log2_transformed %>%
+  PomaNorm(method = "auto_scaling")
+# Create boxplots for visualization before and after normalization
+a <- PomaBoxplots(imputed, x = "samples") +
+     ggplot2::ggtitle("Not Normalized") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank())
+b <- PomaBoxplots(log2_transformed, x = "samples") +
+     ggplot2::ggtitle("Log transformed") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank())
+c <- PomaBoxplots(normalized, x = "samples") +
+    ggplot2::ggtitle("Auto scaling") +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank())
+# Combine the plots for comparison
+#a + b + c
+b + c
+```
+
+```{r hepaticp-03, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.width=8}
+# Convert normalized data to a data frame
+exposures_Normalized <- as.data.frame(normalized@assays@data@listData)
+metabolomics_data <- exposures_Normalized
+# Perform hierarchical clustering to detect outliers in metabolites
+sampleTree <- hclust(dist(t(exposures_Normalized)), method = "average")
+plot(sampleTree, main = "Polars and Semipolars: Clustering to Detect Outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+## Prepare covariates and orientation for limma (polar metabolome)
+
+```{r hepaticp-04, message=FALSE, warning=FALSE}
+exposures_Normalized <- t(exposures_Normalized)   # samples x metabolites
+df <- phenotype_PolarSemipolars
+df$Gender_M0F1 <- ifelse(df$Gender_M0F1 == "Male", 0, 1)
+df$Steatosis <- ifelse(df$steatosis_Kleiner == 0, 0, 1)
+df$Inflammation <- ifelse(df$inflammation_Kleiner == 0, 0, 1)
+df$Fibrosis <- ifelse(df$fibrosis_Kleiner_04 == 0, 0, 1)
+df$steatosis_Kleiner <- NULL; df$inflammation_Kleiner <- NULL; df$ballooning_Kleiner <- NULL
+df$NASH_Kleiner_YN <- NULL; df$fibrosis_Kleiner_04 <- NULL; df$NAS_score <- NULL
+df <- df %>% dplyr::rename(Age = Age_yr, Gender = Gender_M0F1, BMI = BMI_kgm2, Glucose = Glucose_mgdL,
+  HbA1c = HbA1c_percent, AST = AST_UL, ALT = ALT_UL, GGT = GGT_UL, Cholesterol = Cholesterol_mgdL,
+  HDL = HDL_mgdL, LDL = LDL_mgdL, Triglycerides = TG_mgdL)
+```
+
+#### DEGs Metabolomics
+
+```{r hepaticp-05}
+# Transpose matrix: rows = metabolites, columns = samples
+metabo_mat <- t(as.matrix(exposures_Normalized))
+# Check dimensions
+dim(metabo_mat)
+# Should be: features x samples, e.g., 701 x 189
+# Ensure column names match metadata rownames
+all(colnames(metabo_mat) == rownames(df))  # should be TRUE
+# Phenotype metadata
+metadata <- df
+metadata$Steatosis <- factor(metadata$Steatosis, levels = c(0,1))
+metadata$Inflammation <- factor(metadata$Inflammation, levels = c(0,1))
+metadata$Fibrosis <- factor(metadata$Fibrosis, levels = c(0,1))
+metadata$Gender <- factor(metadata$Gender, levels = c(0,1))  # 0 = Male, 1 = Female
+# Differential analysis function
+run_diff <- function(phenotype){
+  design <- model.matrix(~ Age + BMI + Gender + metadata[[phenotype]], data = metadata)
+
+  fit <- lmFit(metabo_mat, design)
+  fit <- eBayes(fit)
+
+  # Coefficient of interest = last column (phenotype effect)
+  coef_name <- ncol(design)
+  res <- topTable(fit, coef = coef_name, number = Inf, adjust.method = "fdr")
+  return(res)
+}
+# Run for each phenotype
+res_steatosis <- run_diff("Steatosis")
+res_inflammation <- run_diff("Inflammation")
+res_fibrosis <- run_diff("Fibrosis")
+# Filter significant metabolites (FDR ≤ 0.10)
+sig_steatosis <- res_steatosis[res_steatosis$adj.P.Val <= 0.1, ]
+sig_inflammation <- res_inflammation[res_inflammation$adj.P.Val <= 0.1, ]
+sig_fibrosis <- res_fibrosis[res_fibrosis$adj.P.Val <= 0.1, ]
+# Add phenotype and direction columns for each condition
+sig_steatosis_tbl <- sig_steatosis %>%
+  mutate(Phenotype = "Steatosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_steatosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_inflammation_tbl <- sig_inflammation %>%
+  mutate(Phenotype = "Inflammation",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_inflammation)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_fibrosis_tbl <- sig_fibrosis %>%
+  mutate(Phenotype = "Fibrosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_fibrosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+# Combine all into a single table
+combined_sig_tbl_biospy <- bind_rows(sig_steatosis_tbl, sig_inflammation_tbl)
+# Optional: sort by Phenotype and logFC
+combined_sig_tbl_biospy <- combined_sig_tbl_biospy %>%
+  arrange(Phenotype, desc(logFC))
+combined_sig_tbl_biospy$Tissue <- "Biopsy"
+# View table
+write.csv(combined_sig_tbl_biospy, "Supplementary_Table_Significant_Metabolites.csv", row.names = FALSE)
+```
+
+## Table S4
+
+```{r hepaticp-06, message=FALSE, warning=FALSE}
+add_table("Table S4", combined_sig_tbl_biospy %>% dplyr::select(-dplyr::any_of("Tissue")))
+# m/z and retention time are added from the feature annotation file in the published table.
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Hepatic_polar_metabolome")   # lets the next step start from here
+```
