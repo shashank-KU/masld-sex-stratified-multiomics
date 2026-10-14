@@ -1,0 +1,252 @@
+---
+title: "Hepatic lipidome (Table S3)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Hepatic_lipidome.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig1_hepatic_transcriptome`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig1_hepatic_transcriptome")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Hepatic_lipidome")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Hepatic lipidome: Table S3
+
+Liver lipidomics (n = 211): POMA preprocessing (half-minimum imputation, log2, autoscaling) and limma adjusted for age, BMI and sex; FDR <= 0.10.
+
+#### Read Input Data and Subsetting Based on Gender for Downstream Analysis
+
+```{r hepaticl-01, message=FALSE, warning=FALSE, error=FALSE}
+# Load description data
+description <- data.frame(readxl::read_excel(file.path(project_dir, "Analyisis/description.xlsx")))
+rownames(description) <- description$Exposure
+description <- description[, -2]
+# Load exposures data
+exposures <- data.frame(readxl::read_excel(file.path(project_dir, "Analyisis/exposures.xlsx")))
+rownames(exposures) <- exposures$id
+exposures <- exposures[, -1]
+# Replace zeros with NA
+exposures[exposures == 0] <- NA
+# Align exposures with phenotypic data
+common_rows <- intersect(rownames(exposures), rownames(phenotype))
+exposures_reordered <- exposures[rownames(phenotype), , drop = FALSE]
+exposures <- exposures_reordered
+# Validate alignment
+table(row.names(exposures) == row.names(phenotype))
+# Modify description data for better labeling
+description$ID <- paste0(description$Family, "_", row.names(description))
+description$ID <- gsub("rowid_", "", description$ID)
+description$ID <- gsub(" ", "_", description$ID)
+# Update row names for exposures
+exposures <- t(exposures)
+new_row_names <- description$ID[match(rownames(exposures), rownames(description))]
+rownames(exposures) <- new_row_names
+exposures <- t(exposures)
+lipidomics_exposures <- exposures
+# Clean phenotype data
+df <- tibble::rownames_to_column(phenotype, "SampleID")
+min_value_GGT_UL <- min(df$GGT_UL, na.rm = TRUE)
+df$GGT_UL[is.na(df$GGT_UL)] <- min_value_GGT_UL / 2
+df$Menopause_YN <- NULL
+```
+
+#### Data Normalization and Visualization
+
+```{r hepaticl-02, fig.align='center', fig.height=8, fig.width=12}
+# Create a POMA object
+data <- POMA::PomaCreateObject(metadata = df, features = exposures)
+# Impute missing data using half-minimum method
+imputed <- data %>%
+  PomaImpute(method = "half_min", zeros_as_na = TRUE, remove_na = TRUE, cutoff = 20)
+log2_transformed <- imputed %>%
+    PomaNorm(method = "log_transform")
+# Normalize the data using log scaling
+normalized <- log2_transformed %>%
+  PomaNorm(method = "auto_scaling")
+# Create boxplots for visualization before and after normalization
+a <- PomaBoxplots(imputed, x = "samples") +
+     ggplot2::ggtitle("Not Normalized") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank())
+b <- PomaBoxplots(log2_transformed, x = "samples") +
+     ggplot2::ggtitle("Log transformed") +
+     ggplot2::theme(axis.text.x = ggplot2::element_blank())
+c <- PomaBoxplots(normalized, x = "samples") +
+    ggplot2::ggtitle("Auto scaling") +
+    ggplot2::theme(axis.text.x = ggplot2::element_blank())
+# Combine the plots for comparison
+#a + b + c
+b + c
+```
+
+```{r hepaticl-03, message=FALSE, warning=FALSE, results='hide', fig.align='center', fig.width=8}
+# Convert normalized data to a data frame
+exposures_Normalized <- as.data.frame(normalized@assays@data@listData)
+# Perform hierarchical clustering to detect outliers in metabolites
+sampleTree <- hclust(dist(t(exposures_Normalized)), method = "average")
+plot(sampleTree, main = "Metabolites (Lipidomics) Clustering to Detect Outliers",
+     sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+## Prepare covariates and sample alignment for limma (lipidome)
+
+```{r hepaticl-04, message=FALSE, warning=FALSE}
+df <- phenotype
+df$Gender_M0F1 <- ifelse(df$Gender_M0F1 == "Male", 0, 1)
+df$Steatosis <- ifelse(df$steatosis_Kleiner == 0, 0, 1)
+df$Inflammation <- ifelse(df$inflammation_Kleiner == 0, 0, 1)
+df$Fibrosis <- ifelse(df$fibrosis_Kleiner_04 == 0, 0, 1)
+df$steatosis_Kleiner <- NULL; df$inflammation_Kleiner <- NULL; df$ballooning_Kleiner <- NULL
+df$NASH_Kleiner_YN <- NULL; df$fibrosis_Kleiner_04 <- NULL; df$NAS_score <- NULL; df$Menopause_YN <- NULL
+df <- df %>% dplyr::rename(Age = Age_yr, Gender = Gender_M0F1, BMI = BMI_kgm2, Glucose = Glucose_mgdL,
+  HbA1c = HbA1c_percent, AST = AST_UL, ALT = ALT_UL, GGT = GGT_UL, Cholesterol = Cholesterol_mgdL,
+  HDL = HDL_mgdL, LDL = LDL_mgdL, Triglycerides = TG_mgdL)
+# align covariates with the normalised lipid matrix (features x samples)
+common_samples <- intersect(colnames(exposures_Normalized), rownames(df))
+df <- df[common_samples, ]
+df$SampleID <- rownames(df)
+```
+
+#### DEGs Lipids
+
+```{r hepaticl-05}
+# Transpose matrix: rows = metabolites, columns = samples
+metabo_mat <- (as.matrix(exposures_Normalized))
+# Check dimensions
+dim(metabo_mat)
+# Should be: features x samples, e.g., 701 x 189
+# Ensure column names match metadata rownames
+all(colnames(metabo_mat) == (df$SampleID))  # should be TRUE
+# Phenotype metadata
+metadata <- df
+metadata$Steatosis <- factor(metadata$Steatosis, levels = c(0,1))
+metadata$Inflammation <- factor(metadata$Inflammation, levels = c(0,1))
+metadata$Fibrosis <- factor(metadata$Fibrosis, levels = c(0,1))
+metadata$Gender <- factor(metadata$Gender, levels = c(0,1))  # 0 = Male, 1 = Female
+# Differential analysis function
+run_diff <- function(phenotype){
+  design <- model.matrix(~ Age + BMI + Gender + metadata[[phenotype]], data = metadata)
+
+  fit <- lmFit(metabo_mat, design)
+  fit <- eBayes(fit)
+
+  # Coefficient of interest = last column (phenotype effect)
+  coef_name <- ncol(design)
+  res <- topTable(fit, coef = coef_name, number = Inf, adjust.method = "fdr")
+  return(res)
+}
+# Run for each phenotype
+res_steatosis <- run_diff("Steatosis")
+res_inflammation <- run_diff("Inflammation")
+res_fibrosis <- run_diff("Fibrosis")
+# Filter significant metabolites (FDR ≤ 0.10)
+sig_steatosis <- res_steatosis[res_steatosis$adj.P.Val <= 0.1, ]
+sig_inflammation <- res_inflammation[res_inflammation$adj.P.Val <= 0.1, ]
+sig_fibrosis <- res_fibrosis[res_fibrosis$adj.P.Val <= 0.1, ]
+# Add phenotype and direction columns for each condition
+sig_steatosis_tbl <- sig_steatosis %>%
+  mutate(Phenotype = "Steatosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_steatosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_inflammation_tbl <- sig_inflammation %>%
+  mutate(Phenotype = "Inflammation",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_inflammation)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+sig_fibrosis_tbl <- sig_fibrosis %>%
+  mutate(Phenotype = "Fibrosis",
+         Direction = ifelse(logFC > 0, "Up", "Down"),
+         Metabolite = rownames(sig_fibrosis)) %>%
+  select(Metabolite, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction)
+# Combine all into a single table
+combined_sig_tbl <- bind_rows(sig_steatosis_tbl, sig_inflammation_tbl, sig_fibrosis_tbl)
+# Optional: sort by Phenotype and logFC
+combined_sig_tbl <- combined_sig_tbl %>%
+  arrange(Phenotype, desc(logFC))
+# View table
+write.csv(combined_sig_tbl, "Supplementary_Table_Significant_LIPIDS.csv", row.names = FALSE)
+```
+
+Plot summary for above result
+
+```{r hepaticl-06}
+# ---- 1. Phenotype-level summary ----
+lipid_summary <- combined_sig_tbl %>%
+  group_by(Phenotype, Direction) %>%
+  summarise(n = n(), .groups = "drop")
+p1 <- ggplot(lipid_summary, aes(x = Phenotype, y = n, fill = Direction)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.6) +
+  scale_fill_manual(values = c("Up" = "#ffa500ff", "Down" = "#4575B4")) +
+  labs(
+    title = "Differential Lipids Across MASLD Histological Features",
+    x = "Phenotype",
+    y = "Number of Differential Lipids",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+# ---- 2. Breakdown by lipid class ----
+# Clean metabolite names to extract lipid class (before first "_")
+combined_sig_tbl <- combined_sig_tbl %>%
+  mutate(LipidClass = str_extract(Metabolite, "^[^_]+"))
+lipid_class_summary <- combined_sig_tbl %>%
+  group_by(Phenotype, LipidClass, Direction) %>%
+  summarise(n = n(), .groups = "drop")
+lipid_class_summary$Phenotype <- factor(
+  lipid_class_summary$Phenotype,
+  levels = c("Steatosis", "Inflammation", "Fibrosis")
+)
+# Plot with correct order
+p2 <- ggplot(lipid_class_summary, aes(x = LipidClass, y = n, fill = Direction)) +
+  geom_bar(stat = "identity", position = "stack") +
+  facet_wrap(~ Phenotype, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c("Up" = "#ffa500ff", "Down" = "#4575B4")) +
+  labs(
+    title = "Differential Lipids by Class Across MASLD Features",
+    x = "Lipid Class",
+    y = "Number of Differential Lipids",
+    fill = "Direction"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(size = 13, face = "bold")
+  )
+# Print plots
+p1
+p2
+```
+
+## Table S3
+
+```{r hepaticl-07, message=FALSE, warning=FALSE}
+add_table("Table S3", combined_sig_tbl %>%
+  dplyr::transmute(`Lipid main ID` = Metabolite, `Lipid Class` = LipidClass, Phenotype, logFC, AveExpr, t, P.Value, adj.P.Val, Direction))
+# NOTE: in the published table 'Lipid main ID' is the curated lipid name (e.g. TG(50:0)) and 'Lipid Class' the curated class;
+# here the feature identifier of the lipid matrix is written to the first column.
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Hepatic_lipidome")   # lets the next step start from here
+```
