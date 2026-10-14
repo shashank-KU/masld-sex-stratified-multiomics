@@ -1,10 +1,10 @@
    data/*
    !data/README.md
-   results/*
-   *.RData
-   *.rds
-   .Rhistory
-   .Rproj.user/
-   *.html
-   *.xlsx
-   !*/Source_data/*.xlsx
+   !data/Analyisis/
+   data/Analyisis/*
+   !data/Analyisis/Metadata.xlsx
+   !data/Transcriptomics/
+   data/Transcriptomics/*
+   !data/Transcriptomics/MAFALDA_STAR/
+   data/Transcriptomics/MAFALDA_STAR/*
+   !data/Transcriptomics/MAFALDA_STAR/genes.expected_count.txt
