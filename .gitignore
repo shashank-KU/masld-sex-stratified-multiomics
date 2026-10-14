@@ -1,9 +1,6 @@
-# Input data: only the files listed here are tracked
+# Input data: nothing in data/ is tracked except the README
 data/*
 !data/README.md
-!data/Analyisis/
-data/Analyisis/*
-!data/Analyisis/Metadata.xlsx
 
 # Results, caches and R session files
 results/*
@@ -16,4 +13,3 @@ results/*
 # xlsx is ignored, except the summary-level Source Data
 *.xlsx
 !*/Source_data/*.xlsx
-!data/Analyisis/Metadata.xlsx
