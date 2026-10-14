@@ -1,0 +1,11 @@
+   data/*
+   !data/README.md
+   results/*
+   *.RData
+   *.rds
+   .Rhistory
+   .Rproj.user/
+   *.html
+   # xlsx is ignored, except the summary-level Source Data
+   *.xlsx
+   !*/Source_data/*.xlsx
