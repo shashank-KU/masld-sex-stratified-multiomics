@@ -105,8 +105,6 @@ masld-sex-stratified-multiomics/
 │   ├── Supp_EPoS_serum_validation/
 │   └── Supp_methods_tables/
 ├── scripts/                                  # standalone figure scripts
-├── data/                                     # inputs (not tracked), see data/README.md
-├── results/                                  # written by the code (git-ignored)
 └── assets/                                   # README graphics
 ```
 
