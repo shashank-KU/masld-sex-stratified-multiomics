@@ -1,0 +1,404 @@
+---
+title: "Fig. 1 (and Fig. S1): hepatic transcriptome"
+author:
+  - name: "Shashank Gupta"
+    affiliation: "Örebro University"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 2
+---
+
+This script reproduces **Fig. 1 (and Fig. S1): hepatic transcriptome**. It reuses the setup below; objects from earlier analyses may be required (see ../README.md for the run order), or knit `analysis/MASLD_main_manuscript_analysis.Rmd` as a whole. Source Data are written to `results/source_data/`.
+
+# 1. Setup
+
+Packages, paths, significance thresholds and helper functions. Inputs are read from `data/`; tables and figures are written to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE
+)
+
+# ---- Paths -------------------------------------------------------------
+# Raw input files are read from data/ (not included in the repository, see data/README.md) and everything
+# that is written goes to results/. Both are resolved once, to absolute paths, in this order:
+#   1. environment variable MASLD_DATA_DIR / MASLD_RESULTS_DIR
+#   2. ../data and ../results (this file lives in analysis/), or data/ and results/ in the working directory
+.cands <- c(Sys.getenv("MASLD_DATA_DIR", unset = NA), "../data", "data")
+.cands <- .cands[!is.na(.cands) & nzchar(.cands)]
+.hit <- .cands[dir.exists(.cands)]
+if (!length(.hit)) stop("Input folder not found. Set it first, e.g.\n  Sys.setenv(MASLD_DATA_DIR = \"/path/to/folder/with/Analyisis\")")
+project_dir <- normalizePath(.hit[1])
+.res <- Sys.getenv("MASLD_RESULTS_DIR",
+                   unset = if (basename(project_dir) == "data") file.path(dirname(project_dir), "results") else file.path(project_dir, "results"))
+dir.create(file.path(.res, "tables"), showWarnings = FALSE, recursive = TRUE)
+results_dir <- normalizePath(.res)
+OUT_DIR <- results_dir                           # used by the Table 1 chunk
+knitr::opts_knit$set(root.dir = results_dir)     # relative output paths land in results/
+setwd(results_dir)                               # same when run chunk by chunk in the console
+message("Input folder:  ", project_dir, "\nResults folder: ", results_dir)
+
+# Supplementary Tables workbook (published with the paper); only used to read Table S3 (curated lipid names)
+# and to compare column names of the tables written below.
+SUPP_XLSX <- Sys.getenv("MASLD_SUPP_XLSX", unset = file.path(project_dir, "gupta_MASLD_SupplementaryTables.xlsx"))
+
+# ---- Significance thresholds (Benjamini-Hochberg FDR) -------------------
+FDR_GENE  <- 0.05   # DESeq2 genes (Table S1, Figs 1, 3, 6) and external replication (Tables S5-S7)
+FDR_OMICS <- 0.10   # limma lipids and metabolites (Tables S3, S4, S10a, S10b, S11, S12, S19, S20)
+FDR_KEGG  <- 0.10   # KEGG enrichment, at least 3 genes (Table S2b, Table S7)
+
+# ---- Supplementary tables are collected in manuscript order ---------------
+SUPP <- list()
+add_table <- function(name, x) {
+  SUPP[[name]] <<- x
+  if (is.data.frame(x)) {
+    write.csv(x, file.path(results_dir, "tables", paste0(gsub(" ", "_", name), ".csv")), row.names = FALSE)
+  } else for (lab in names(x)) if (is.data.frame(x[[lab]]))
+    write.csv(x[[lab]], file.path(results_dir, "tables", paste0(gsub(" ", "_", name), "_", gsub("[^A-Za-z0-9]+", "_", lab), ".csv")), row.names = FALSE)
+  invisible(x)
+}
+
+# Source Data workbooks (Nature style: one sheet per figure panel) -> results/source_data/
+sd_panel <- function(name, desc, data) list(name = name, desc = desc, data = as.data.frame(data))
+write_source_data <- function(file, panels) {
+  dir.create(file.path(results_dir, "source_data"), showWarnings = FALSE, recursive = TRUE)
+  wb <- openxlsx::createWorkbook()
+  for (p in panels) {
+    sh <- substr(p$name, 1, 31)
+    openxlsx::addWorksheet(wb, sh)
+    openxlsx::writeData(wb, sh, p$desc, startRow = 1)
+    openxlsx::writeData(wb, sh, p$data, startRow = 3)
+  }
+  openxlsx::saveWorkbook(wb, file.path(results_dir, "source_data", file), overwrite = TRUE)
+  message("Wrote source data: ", file)
+}
+
+# dotplot of an enrichment result; returns NULL (instead of an error) when nothing is enriched
+safe_dotplot <- function(x, ...) {
+  if (is.null(x) || nrow(as.data.frame(x)) == 0) return(invisible(NULL))
+  enrichplot::dotplot(x, ...)
+}
+```
+
+```{r setup-02, warning=FALSE, message=FALSE, results='hide'}
+# Load necessary libraries for data manipulation and visualization
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(gtsummary)
+library(ggplot2)
+library(tidyverse)
+library(RColorBrewer)
+library(POMA)
+library(ggtext)
+library(magrittr)
+library(tibble)
+library(cowplot)
+library(patchwork)
+library(ggpubr)
+library(ggstatsplot)
+library(mediation)
+library(limma)
+library(ggcorrplot)
+library(stats)
+library(corrplot)
+library(GO.db)
+library(GenomicFeatures)
+library(AnnotationDbi)
+library(DESeq2)
+library(dbplyr)
+library(dplyr)
+library(readr)
+library(gridExtra)
+library(grid)
+library(stringr)
+theme_set(theme_bw())
+```
+
+
+# 3. Hepatic transcriptome: Fig. 1 and Tables S1-S2b
+
+Liver RNA-seq in 208 participants. DESeq2 (Wald test, apeglm shrinkage) adjusted for age, BMI and sex; genes with >= 10 reads in >= 10 samples; DEGs at FDR <= 0.05; KEGG enrichment of up- and downregulated DEGs at FDR <= 0.10 with >= 3 genes. PCA of the variance-stabilised counts is Fig. S1.
+
+```{r hepatict-01, warning=FALSE, message=FALSE}
+host_liver_rawCounts <- read.table(file.path(project_dir, "Transcriptomics/MAFALDA_STAR/genes.expected_count.txt"), header = T, row.names = 1)
+# Load phenotypic data from an Excel file
+phenotype <- data.frame(readxl::read_excel(file.path(project_dir, "Analyisis/Metadata.xlsx")))
+rownames(phenotype) <- phenotype$id
+phenotype <- phenotype[,-1]
+# Rename column names to remove trailing "LAT" if present
+colnames(host_liver_rawCounts) <- sub("LAT$", "", colnames(host_liver_rawCounts))
+# Ensure the column names of host_liver_rawCounts match row names of phenotype
+common_samples <- intersect(colnames(host_liver_rawCounts), rownames(phenotype))
+# Subset host_liver_rawCounts to include only the common samples
+host_liver_rawCounts_subset <- host_liver_rawCounts[, common_samples]
+# Reorder phenotype to match the order of columns in host_liver_rawCounts_subset
+phenotype_subset <- phenotype[common_samples, ]
+# Calculate the total count for each gene across all samples
+total_counts_per_gene <- rowSums(host_liver_rawCounts_subset)
+# Identify genes that are singletons (total count <= 1)
+singleton_genes <- total_counts_per_gene <= 10
+# Subset the count data to exclude singleton genes
+host_liver_rawCounts_filtered <- host_liver_rawCounts_subset[!singleton_genes, ]
+# Check dimensions to ensure they match
+dim(host_liver_rawCounts_subset)
+dim(host_liver_rawCounts_filtered)
+dim(phenotype_subset)
+all(colnames(host_liver_rawCounts_filtered) == row.names(phenotype_subset))
+# Load DESeq2 library
+library(DESeq2)
+host_liver_rawCounts_filtered <- round(host_liver_rawCounts_filtered)
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = host_liver_rawCounts_filtered,
+  colData = phenotype_subset,
+  design = ~1
+)
+# Samples left out of the RNA-seq analysis (208 participants remain)
+remove_samples <- c("LIVMF239", "LIVMF99")
+dds <- dds[, !colnames(dds) %in% remove_samples]
+# Check that they were removed
+colnames(dds)
+dim(dds)
+# Run DESeq2
+dds <- DESeq(dds)
+# Check results names
+resultsNames(dds)
+
+```
+
+#### Transcriptomics (N=208)
+
+```{r hepatict-02}
+## =====================================================================
+## Liver RNA-seq: differential expression -> KEGG enrichment -> Figure 1
+##                -> Tables S1, S2a, S2b (+ Fig. S1 PCA)
+##
+## Needs the DESeq2 object `dds` (208 participants). Outputs go to DEG_208/.
+## Model: ~ age (z) + BMI (z) + sex + trait; genes with >= 10 reads in >= 10 samples.
+## =====================================================================
+suppressPackageStartupMessages({
+    library(DESeq2); library(apeglm)
+    library(clusterProfiler); library(org.Hs.eg.db); library(AnnotationDbi); library(enrichplot)
+    library(dplyr); library(tidyr); library(ggplot2)
+    library(cowplot); library(ggvenn); library(EnhancedVolcano); library(openxlsx)
+})
+OUT <- "DEG_208"; dir.create(OUT, showWarnings = FALSE)
+f <- function(x) file.path(OUT, x)
+## ---------------------------------------------------------------------
+## 0. Settings
+## ---------------------------------------------------------------------
+MIN_COUNT  <- 10                          # reads
+MIN_SAMPLES <- 10                         # in at least this many samples (21,114 genes)
+TRAITS     <- c("Steatosis", "Inflammation", "Fibrosis")
+strip_ver <- function(x) sub("\\..*$", "", x)
+## ---------------------------------------------------------------------
+## 1. Samples and genes
+## ---------------------------------------------------------------------
+d0 <- dds                      # 208 participants (two samples already removed with the DESeq2 object)
+n_start <- ncol(d0); genes_start <- nrow(d0)
+rownames(d0) <- strip_ver(rownames(d0))
+## ---------------------------------------------------------------------
+## 2. Covariates, phenotypes, expression filter
+## ---------------------------------------------------------------------
+d0$Gender <- factor(d0$Gender_M0F1, levels = c("Male", "Female"))
+d0$Age_z  <- as.numeric(scale(d0$Age_yr))
+d0$BMI_z  <- as.numeric(scale(d0$BMI_kgm2))
+d0$Steatosis    <- factor(ifelse(d0$steatosis_Kleiner    == 0, 0, 1), levels = c(0, 1))
+d0$Inflammation <- factor(ifelse(d0$inflammation_Kleiner == 0, 0, 1), levels = c(0, 1))
+d0$Fibrosis     <- factor(ifelse(d0$fibrosis_Kleiner_04  == 0, 0, 1), levels = c(0, 1))
+keep <- rowSums(counts(d0) >= MIN_COUNT) >= MIN_SAMPLES
+d0 <- d0[keep, ]
+cat("Samples:", ncol(d0), "| women:", sum(d0$Gender == "Female"),
+    "| men:", sum(d0$Gender == "Male"), "| genes kept:", nrow(d0), "of", genes_start, "\n")
+sym <- mapIds(org.Hs.eg.db, keys = rownames(d0), keytype = "ENSEMBL",
+              column = "SYMBOL", multiVals = "first")
+## ---------------------------------------------------------------------
+## 3. DEGs (identical model for each trait)
+## ---------------------------------------------------------------------
+run_deg <- function(trait) {
+    d <- d0
+    design(d) <- as.formula(paste("~ Age_z + BMI_z + Gender +", trait))
+    d <- DESeq(d, quiet = TRUE)
+    cf <- paste0(trait, "_1_vs_0")
+    res <- results(d, name = cf, alpha = FDR_GENE)
+    shr <- lfcShrink(d, coef = cf, type = "apeglm", res = res, quiet = TRUE)
+    shr <- shr[!is.na(shr$padj), ]
+    shr$Gene <- unname(sym[rownames(shr)]); shr$Gene[is.na(shr$Gene)] <- ""
+    shr
+}
+res <- setNames(lapply(TRAITS, run_deg), TRAITS)
+degs <- lapply(res, function(r) r[r$padj <= FDR_GENE, ])
+up   <- lapply(degs, function(r) rownames(r)[r$log2FoldChange > 0])
+down <- lapply(degs, function(r) rownames(r)[r$log2FoldChange < 0])
+## ---------------------------------------------------------------------
+## 4. Enrichment (tested genes as background, BH-FDR ≤ 0.10)
+## ---------------------------------------------------------------------
+to_entrez <- function(ens) unique(na.omit(mapIds(org.Hs.eg.db, keys = ens, keytype = "ENSEMBL",
+                                                 column = "ENTREZID", multiVals = "first")))
+universe <- to_entrez(rownames(d0))
+fdr_keep <- function(e) { if (!is.null(e)) e@result <- subset(e@result, p.adjust <= FDR_KEGG); e }
+go_fun <- function(g) fdr_keep(enrichGO(to_entrez(g), universe = universe, OrgDb = org.Hs.eg.db,
+                                        ont = "BP", pAdjustMethod = "BH", pvalueCutoff = 1,
+                                        qvalueCutoff = 1, readable = TRUE))
+kegg_fun <- function(g) {
+    e <- enrichKEGG(to_entrez(g), universe = universe, organism = "hsa",
+                    pAdjustMethod = "BH", pvalueCutoff = 1, qvalueCutoff = 1)
+    if (!is.null(e)) e <- setReadable(e, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+    fdr_keep(e)
+}
+enr <- list()
+for (t in TRAITS) for (dir in c("Up", "Down")) {
+    g <- if (dir == "Up") up[[t]] else down[[t]]
+    enr[[paste(t, dir, "GO", sep = "_")]]   <- if (length(g)) go_fun(g) else NULL
+    enr[[paste(t, dir, "KEGG", sep = "_")]] <- if (length(g)) kegg_fun(g) else NULL
+}
+enr_table <- function(type) bind_rows(lapply(names(enr)[grepl(paste0("_", type, "$"), names(enr))], function(n) {
+    e <- enr[[n]]; if (is.null(e) || nrow(e@result) == 0) return(NULL)
+    p <- strsplit(n, "_")[[1]]
+    mutate(e@result, Phenotype = p[1], Direction = p[2], Type = type)
+}))
+kegg_all <- enr_table("KEGG"); go_all <- enr_table("GO")
+if (nrow(kegg_all)) {
+    if (!"category" %in% names(kegg_all)) kegg_all$category <- NA
+    kegg_all$category[kegg_all$ID == "hsa04820"] <- "Cellular Processes"
+}
+## ---------------------------------------------------------------------
+## 5. Figure 1
+## ---------------------------------------------------------------------
+make_volcano <- function(r, title) {
+    col <- ifelse(r$padj <= FDR_GENE & r$log2FoldChange >  1, "#ffa500ff",
+                  ifelse(r$padj <= FDR_GENE & r$log2FoldChange < -1, "#4575B4", "grey"))
+    names(col) <- ifelse(col == "grey", "NS", ifelse(col == "#4575B4", "Down", "Up"))
+    EnhancedVolcano(r, lab = r$Gene, x = "log2FoldChange", y = "padj",
+                    ylab = bquote(~-Log[10]~italic(FDR)),
+                    pCutoff = FDR_GENE, FCcutoff = 1, colCustom = col,
+                    title = title, subtitle = NULL, caption = NULL,
+                    labSize = 4, pointSize = 2.5, colAlpha = 0.8,
+                    drawConnectors = TRUE, widthConnectors = 0.3, max.overlaps = 15,
+                    legendPosition = "none")
+}
+vol <- lapply(TRAITS, function(t) make_volcano(res[[t]], t))
+venn <- function(lst, colr, ttl) ggvenn(lst, fill_color = rep(colr, 3), stroke_size = 0.5,
+                                        set_name_size = 5, text_size = 4, show_percentage = FALSE) +
+    ggtitle(ttl) + theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+                         panel.background = element_rect(fill = "white", colour = NA))
+venn_up   <- venn(up,   "#ffa500ff", "Up-regulated DEGs")
+venn_down <- venn(down, "#4575B4",   "Down-regulated DEGs")
+kegg_plot_df <- kegg_all %>%
+    group_by(Phenotype, Direction) %>% arrange(p.adjust) %>% slice_head(n = 10) %>% ungroup() %>%
+    filter(Count >= 3) %>%
+    mutate(Phenotype = factor(Phenotype, levels = TRAITS),
+           Description = factor(Description, levels = unique(Description[order(Direction, p.adjust)])))
+kegg_dot <- ggplot(kegg_plot_df, aes(Phenotype, Description, size = -log10(p.adjust), colour = Direction)) +
+    geom_point(position = position_jitter(width = 0.2, height = 0, seed = 1), alpha = 0.8) +
+    facet_grid(category ~ ., scales = "free_y", space = "free_y") +
+    scale_colour_manual(values = c(Up = "#ffa500ff", Down = "#4575B4")) +
+    scale_size_continuous(range = c(3, 8)) + scale_x_discrete(drop = FALSE) +
+    theme_bw(base_size = 12) +
+    labs(size = "-log10(FDR)", colour = "Direction", x = "Phenotype", y = "KEGG Pathway") +
+    theme(axis.text.y = element_text(size = 10, colour = "black"),
+          axis.text.x = element_text(size = 12, colour = "black"),
+          axis.title = element_text(size = 13, face = "bold"),
+          strip.text.y = element_text(angle = 0, size = 12, face = "bold"),
+          panel.grid = element_blank())
+row1   <- plot_grid(plotlist = vol, ncol = 3, align = "h", labels = "a", label_size = 16)
+bottom <- plot_grid(plot_grid(venn_up, venn_down, ncol = 1, labels = "b", label_size = 16),
+                    ggplotGrob(kegg_dot), ncol = 2, rel_widths = c(1, 1.5),
+                    labels = c("", "c"), label_size = 16)
+fig2 <- plot_grid(row1, bottom, ncol = 1, rel_heights = c(1, 1.5)) +
+    theme(plot.background = element_rect(fill = "white", colour = NA))
+ggsave(f("Fig1_DEGs.png"),  fig2, width = 19, height = 15, dpi = 300, bg = "white")
+ggsave(f("Fig1_DEGs.tiff"), fig2, width = 19, height = 15, dpi = 300, compression = "lzw", bg = "white")
+ggsave(f("Fig1_DEGs.pdf"),  fig2, width = 19, height = 15, bg = "white")
+## Fig. S1: PCA of the variance-stabilised counts (n = 208)
+vsd <- vst(d0, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "Gender", returnData = TRUE); pv <- round(100 * attr(pca, "percentVar"))
+figS1 <- ggplot(pca, aes(PC1, PC2, colour = Gender)) + geom_point(size = 2) + stat_ellipse() +
+    scale_colour_manual(values = c(Male = "#4575B4", Female = "#D73027"), name = "Sex") +
+    labs(x = paste0("PC1: ", pv[1], "% variance"), y = paste0("PC2: ", pv[2], "% variance")) + theme_bw()
+ggsave(f("FigS1_PCA.png"), figS1, width = 6, height = 4.5, dpi = 300, bg = "white")
+## ---------------------------------------------------------------------
+## 6. Tables + numbers workbook
+## ---------------------------------------------------------------------
+S3 <- bind_rows(lapply(TRAITS, function(t) {
+    r <- degs[[t]]
+    data.frame(Ensembl = rownames(r), Symbol = r$Gene, baseMean = r$baseMean,
+               log2FoldChange = r$log2FoldChange, lfcSE = r$lfcSE, pvalue = r$pvalue,
+               padj = r$padj, Histology = t,
+               Direction = ifelse(r$log2FoldChange > 0, "Up", "Down"))
+})) %>% arrange(Histology, padj)
+S4 <- S3 %>% distinct(Ensembl, Symbol, Direction, Histology) %>% mutate(v = 1L) %>%
+    pivot_wider(names_from = Histology, values_from = v, values_fill = 0L) %>%
+    mutate(Total_Phenotypes = rowSums(across(any_of(TRAITS))))
+summary_tab <- data.frame(
+    Trait = TRAITS,
+    cases = sapply(TRAITS, function(t) sum(d0[[t]] == 1)),
+    controls = sapply(TRAITS, function(t) sum(d0[[t]] == 0)),
+    DEGs = sapply(degs, nrow), Up = sapply(up, length), Down = sapply(down, length))
+venn_counts <- function(lst, dir) {
+    u <- unique(unlist(lst)); m <- sapply(lst, function(x) u %in% x)
+    as.data.frame(table(apply(m, 1, function(r) paste(TRAITS[r], collapse = "+")))) |>
+        setNames(c("Region", "n")) |> transform(Direction = dir)
+}
+venn_tab <- rbind(venn_counts(up, "Up"), venn_counts(down, "Down"))
+run_info <- data.frame(
+    item = c("samples", "women", "men", "genes_before_filter", "genes_after_filter", "filter_rule"),
+    value = c(ncol(d0), sum(d0$Gender == "Female"), sum(d0$Gender == "Male"),
+              genes_start, nrow(d0), paste0(">=", MIN_COUNT, " reads in >=", MIN_SAMPLES, " samples")))
+
+sheets <- list(run_info = run_info, trait_groups = summary_tab[, 1:3],
+               DEG_summary = summary_tab, Venn_counts = venn_tab,
+               Table_S1 = S3, Table_S2a = S4, Table_S2b = kegg_all, GO_all = go_all)
+sheets <- Filter(Negate(is.null), sheets)
+wb <- createWorkbook()
+for (n in names(sheets)) { addWorksheet(wb, n); writeData(wb, n, sheets[[n]]) }
+saveWorkbook(wb, f("manuscript_numbers_DEG_208.xlsx"), overwrite = TRUE)
+print(run_info); print(summary_tab)
+cat("\nDone:", f("manuscript_numbers_DEG_208.xlsx"), "and", f("Fig1_DEGs.png"), "\n")
+```
+
+## Source Data Fig. 1 and Fig. S1
+
+```{r hepatict-03, message=FALSE, warning=FALSE}
+sd1_vol <- dplyr::bind_rows(lapply(TRAITS, function(t) {
+  r <- as.data.frame(res[[t]])
+  data.frame(Histology = t, Ensembl_ID = rownames(r), Gene_symbol = r$Gene, baseMean = r$baseMean,
+             log2FoldChange = r$log2FoldChange, lfcSE = r$lfcSE, pvalue = r$pvalue, padj = r$padj,
+             Status = ifelse(r$padj <= FDR_GENE & r$log2FoldChange > 1, "Up (|log2FC| > 1)",
+                      ifelse(r$padj <= FDR_GENE & r$log2FoldChange < -1, "Down (|log2FC| > 1)", "Other")))
+}))
+venn_mem <- function(lst, dir) data.frame(Ensembl_ID = unique(unlist(lst)), Direction = dir) %>%
+  dplyr::bind_cols(as.data.frame(sapply(lst, function(x) as.integer(unique(unlist(lst)) %in% x))))
+sd1_venn <- dplyr::bind_rows(venn_mem(up, "Up"), venn_mem(down, "Down"))
+sd1_venn$Gene_symbol <- unname(sym[sd1_venn$Ensembl_ID])
+write_source_data("Source Data Fig. 1.xlsx", list(
+  sd_panel("Fig. 1a", "Volcano plots: all tested genes per histological feature (DESeq2, apeglm-shrunk log2 fold change, BH-adjusted P value).", sd1_vol),
+  sd_panel("Fig. 1b", "Overlap of up- and downregulated DEGs (FDR <= 0.05) across the three features (1 = significant).", sd1_venn),
+  sd_panel("Fig. 1c", "KEGG pathways plotted (top 10 per feature and direction, >= 3 genes; FDR <= 0.10).",
+           as.data.frame(kegg_plot_df) %>% dplyr::select(dplyr::any_of(c("Phenotype", "Direction", "category", "ID", "Description", "GeneRatio", "BgRatio", "Count", "pvalue", "p.adjust", "qvalue", "geneID"))))))
+write_source_data("Source Data Fig. S1.xlsx", list(
+  sd_panel("Fig. S1", "PCA of variance-stabilised liver counts (208 participants).", pca)))
+```
+
+## Tables S1, S2a and S2b
+
+```{r hepatict-04, message=FALSE, warning=FALSE}
+add_table("Table S1", S3 %>%
+  dplyr::transmute(`Ensembl gene ID` = Ensembl, Direction, baseMean, log2FoldChange, lfcSE, pvalue, padj, Histology, `Gene symbol` = Symbol))
+add_table("Table S2a", S4 %>%
+  dplyr::transmute(`Ensembl ID` = Ensembl, Symbol, Steatosis, Inflammation, Fibrosis, Direction, Total_Phenotypes))
+k <- kegg_all
+for (cl in c("subcategory", "FoldEnrichment")) if (!cl %in% names(k)) k[[cl]] <- NA
+add_table("Table S2b", k %>%
+  dplyr::select(Phenotype, Direction, category, subcategory, ID, Description, GeneRatio, BgRatio,
+                FoldEnrichment, pvalue, p.adjust, qvalue, geneID, Count))
+
+# copies of the discovery results used by the external-validation chunks
+disc_res <- res
+ekegg_up_fibrosis   <- enr[["Fibrosis_Up_KEGG"]]
+ekegg_down_fibrosis <- enr[["Fibrosis_Down_KEGG"]]
+```
+
