@@ -15,7 +15,6 @@ Code for <b>"Matched liver–serum multi-omics and genetic risk reveal hepatic c
 Liver transcriptome, lipidome and polar metabolome, serum metabolome and partitioned polygenic risk scores in 211 MAFALDA participants, with external validation in three public cohorts.
 </p>
 
-
 ---
 
 ## Contents
@@ -36,7 +35,6 @@ Liver transcriptome, lipidome and polar metabolome, serum metabolome and partiti
 4. **Serum adds little to clinical discrimination** (steatosis AUC 0.73 → 0.75; nothing for inflammation, MASH or fibrosis), whereas hepatic metabolites raise it to 0.91 for steatosis.
 5. **A discordant partitioned PRS** (genetic hepatic lipid retention) is associated with higher hepatic but lower serum triglycerides; its effects on inflammation and MASH are largely mediated by liver fat.
 6. **Transcriptomic and hepatic triglyceride signatures replicate externally** (GSE135251, GSE162694, ST000915); the phosphatidylcholine signature does not.
-7. 
 
 ---
 
@@ -49,8 +47,8 @@ Liver transcriptome, lipidome and polar metabolome, serum metabolome and partiti
 | Layer | Source | Participants | Used in |
 |---|---|---:|---|
 | Hepatic transcriptome (RNA-seq) | liver biopsy | 208 | Fig. 1, Fig. 3, Fig. 6 |
-| Hepatic lipidome | liver biopsy | – | Table S3, Fig. 3 |
-| Hepatic polar metabolome | liver biopsy | – | Fig. 2, Table S4, Fig. 4 |
+| Hepatic lipidome | liver biopsy | – | Table S3, Fig. 3, Fig. 6 |
+| Hepatic polar metabolome | liver biopsy | 189 | Fig. 2, Table S4, Fig. 4, Fig. 6 |
 | Serum polar metabolome | serum | 209 | Fig. 2, Table S10a |
 | Matched liver–serum polar metabolome | liver + serum | 187 | Fig. 4, Tables S10b–S11 |
 | Partitioned polygenic risk scores | genotype | 211 | Fig. 5, Table S12 |
@@ -85,26 +83,33 @@ flowchart LR
 
 ## Repository structure
 
+Every figure has its own folder with a self-contained R Markdown script and its tables and Source Data.
+
 ```text
 masld-sex-stratified-multiomics/
 ├── README.md
 ├── LICENSE
-├── analysis/
-│   └── MASLD_main_manuscript_analysis.Rmd   # full workflow, manuscript order, run top to bottom
-├── figures/                                  # one folder per figure / table group
-│   ├── Table1_cohort/
-│   ├── Fig1_hepatic_transcriptome/           #   <folder>.Rmd, source_data/
-│   ├── Hepatic_lipidome/
-│   ├── Hepatic_polar_metabolome/
-│   ├── Fig2_serum_metabolome/
-│   ├── Fig3_external_validation/
-│   ├── Fig4_paired_liver_serum/
-│   ├── Fig5_pPRS/
-│   ├── Fig6_pathway_map/
-│   ├── Supp_EPoS_serum_validation/
-│   └── Supp_methods_tables/
-└── assets/                                   # README graphics
+├── common/
+│   ├── setup.R                          # packages, paths, thresholds, helpers (sourced by every script)
+│   └── README.md
+├── Table1_cohort/                       # <folder>.Rmd + Source_data/
+├── Fig1_hepatic_transcriptome/
+├── Hepatic_lipidome/
+├── Hepatic_polar_metabolome/
+├── Fig2_serum_metabolome/
+├── Fig3_external_validation/
+├── Fig4_paired_liver_serum/
+├── Fig5_pPRS/
+├── Fig6_pathway_map/
+├── Supp_EPoS_serum_validation/
+├── Supp_methods_tables/                 # Tables S17-S18 only (no code)
+├── Assemble_supplementary_tables/       # collects all tables into one workbook
+├── data/                                # input files, not tracked (see data/README.md)
+├── results/                             # created when the code runs, not tracked
+└── assets/                              # README graphics
 ```
+
+Each `<folder>/Source_data/` holds the Supplementary Tables used by that item (`Table_S*.csv`) and the Source Data workbook written by the code.
 
 ---
 
@@ -116,29 +121,38 @@ masld-sex-stratified-multiomics/
 | Fig. 1, Fig. S1 | Hepatic DEGs (steatosis, inflammation, fibrosis), overlap, KEGG | S1, S2a, S2b | `Fig1_hepatic_transcriptome` |
 | – | Hepatic lipid signatures | S3 | `Hepatic_lipidome` |
 | – | Hepatic polar metabolite signatures | S4 | `Hepatic_polar_metabolome` |
-| Fig. 2 | Hepatic and serum polar metabolites | S10a | `Fig2_serum_metabolome` |
+| Fig. 2 | Hepatic and serum polar metabolites | S4, S10a | `Fig2_serum_metabolome` |
 | Fig. 3 | External validation: GSE162694, GSE135251, ST000915 | S5–S9 | `Fig3_external_validation` |
 | Fig. 4 | Paired liver–serum comparison, robustness, AUC | S10b, S11 | `Fig4_paired_liver_serum` |
 | Fig. 5 | Partitioned PRS, mediation by hepatic TG | S12 | `Fig5_pPRS` |
-| Fig. 6 | Liver-to-serum pathway map | – | `Fig6_pathway_map` |
+| Fig. 6 | Liver-to-serum pathway map | S1, S3, S4, S10a, S10b, S12 | `Fig6_pathway_map` |
 | Supplementary | EPoS (ST001711) serum validation | S19, S20 | `Supp_EPoS_serum_validation` |
 | Supplementary | LC-MS conditions, external datasets | S17, S18 | `Supp_methods_tables` |
+| Supplementary | All tables in one workbook | S1–S12, S19–S20 | `Assemble_supplementary_tables` |
 
-Each folder's `tables/` holds the corresponding Supplementary Tables as CSV, with the captions in `tables/README.md`. The ordered workbook is regenerated by the code as `results/tables/Supplementary_Tables_code_output.xlsx`.
+Tables used by more than one item are stored in each folder that uses them. Tables S13–S16 (network and mediation analyses) are not part of this repository.
 
 ---
 
 ## Running the code
 
-```r
-# 1. Point to the folder that contains the input files (see data/README.md)
-Sys.setenv(MASLD_DATA_DIR = "/path/to/data")   # only if not in ../data
+1. Put the input files in `data/` (see `data/README.md`), or point to them:
 
-# 2. Render the full workflow
-rmarkdown::render("analysis/MASLD_main_manuscript_analysis.Rmd")
+```r
+Sys.setenv(MASLD_DATA_DIR = "/path/to/folder/containing/Analyisis")   # only if not in ./data
 ```
 
-The per-figure `.Rmd` files in `figures/` contain the setup plus one section each. Analyses build on each other (Fig. 1 `dds`/`res` → Fig. 3; hepatic and serum limma → Fig. 4 → Figs 5–6), so run the full workflow first or run the folders in manuscript order.
+2. Open any `<folder>/<folder>.Rmd` in RStudio and knit it (or `rmarkdown::render("Fig3_external_validation/Fig3_external_validation.Rmd")`). The repository root is found automatically.
+
+The analyses build on each other (Fig. 1 DESeq2 results → Fig. 3; hepatic and serum limma → Fig. 4 → Figs 5–6). Each script ends by saving its workspace to `results/cache/` and starts by loading the previous step, or by running it first if needed. The order is:
+
+`Table1_cohort` → `Fig1_hepatic_transcriptome` → `Hepatic_lipidome` → `Hepatic_polar_metabolome` → `Fig2_serum_metabolome` → `Fig3_external_validation` → `Fig4_paired_liver_serum` → `Fig5_pPRS` → `Fig6_pathway_map` → `Supp_EPoS_serum_validation` → `Assemble_supplementary_tables`
+
+The first run of a later figure therefore also runs everything before it; later runs reuse the cache.
+
+**Supplementary Tables workbook.** A few steps read the published tables (Table S3 curated lipid names, S11 AUCs, S12). The code uses, in order: the file in `MASLD_SUPP_XLSX`; a file named `gupta_MASLD_SupplementaryTables*.xlsx` in `data/` or the repository root; otherwise a workbook rebuilt from the `Table_S*.csv` files in the `Source_data/` folders.
+
+Optional environment variables: `MASLD_DATA_DIR`, `MASLD_RESULTS_DIR`, `MASLD_SUPP_XLSX`.
 
 Main packages: DESeq2, apeglm, limma, POMA, clusterProfiler, GEOquery, glmnet, pROC, mediation, openxlsx, readxl, ggplot2, dplyr. Generate `sessionInfo.txt` after the final run:
 
@@ -150,25 +164,25 @@ writeLines(capture.output(sessionInfo()), "sessionInfo.txt")
 
 ## Source Data
 
-Knitting writes Nature-style Source Data workbooks, one sheet per panel, to `results/source_data/`:
+Knitting a figure script writes its Nature-style Source Data workbook, one sheet per panel, into that figure's `Source_data/` folder:
 
-| File | Content |
-|---|---|
-| `Source Data Fig. 1.xlsx` | volcano results, DEG overlap, KEGG |
-| `Source Data Fig. 2.xlsx` | Sankey and combined metabolite table |
-| `Source Data Fig. 3.xlsx` | external replication panels a–d |
-| `Source Data Fig. 4.xlsx` | paired liver–serum panels |
-| `Source Data Fig. 5.xlsx` | pPRS associations and mediation |
-| `Source Data Fig. 6.xlsx` | pathway map |
-| `Source Data Fig. S1.xlsx` | PCA |
+| File | Folder | Content |
+|---|---|---|
+| `Source Data Fig. 1.xlsx` | `Fig1_hepatic_transcriptome/Source_data/` | volcano results, DEG overlap, KEGG |
+| `Source Data Fig. S1.xlsx` | `Fig1_hepatic_transcriptome/Source_data/` | PCA |
+| `Source Data Fig. 2.xlsx` | `Fig2_serum_metabolome/Source_data/` | Sankey and combined metabolite table |
+| `Source Data Fig. 3.xlsx` | `Fig3_external_validation/Source_data/` | external replication panels a–d |
+| `Source Data Fig. 4.xlsx` | `Fig4_paired_liver_serum/Source_data/` | paired liver–serum panels |
+| `Source Data Fig. 5.xlsx` | `Fig5_pPRS/Source_data/` | pPRS associations and mediation |
+| `Source Data Fig. 6.xlsx` | `Fig6_pathway_map/Source_data/` | pathway map |
 
-Copy each file into the matching `figures/<folder>/source_data/` for upload.
+Commit these files; they are summary-level. Your `.gitignore` must allow them (`!*/Source_data/*.xlsx`).
 
 ---
 
 ## Data availability
 
-Individual-level data cannot be shared because the consent obtained does not cover public release. Summary-level results are in Supplementary Tables S1–S12 and S19–S20 (and the CSV copies in `figures/*/tables/`). Public datasets: GEO GSE135251 and GSE162694; Metabolomics Workbench ST000915 and ST001711. Pooled quality-control data are deposited at MassIVE ([doi:10.25345/C50P0X49Q](https://doi.org/10.25345/C50P0X49Q)). Do not commit participant identifiers, clinical metadata, omics matrices or intermediate objects; `.gitignore` excludes `data/` and `results/`.
+Individual-level data cannot be shared because the consent obtained does not cover public release. Summary-level results are in Supplementary Tables S1–S12 and S19–S20 (CSV copies in each folder's `Source_data/`). Public datasets: GEO GSE135251 and GSE162694; Metabolomics Workbench ST000915 and ST001711. Pooled quality-control data are deposited at MassIVE ([doi:10.25345/C50P0X49Q](https://doi.org/10.25345/C50P0X49Q)). Do not commit participant identifiers, clinical metadata, omics matrices or intermediate objects; `.gitignore` excludes `data/` and `results/`.
 
 ---
 
