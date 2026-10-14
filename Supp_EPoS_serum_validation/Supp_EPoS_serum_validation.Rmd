@@ -1,0 +1,1513 @@
+---
+title: "Supplementary: EPoS serum validation (Tables S19, S20)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Supp_EPoS_serum_validation.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig6_pathway_map`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig6_pathway_map")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Supp_EPoS_serum_validation")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Supplementary: EPoS serum metabolomics, Tables S19-S20
+
+External comparison of the discovery serum associations with the EPoS cohort (Metabolomics Workbench ST001711; Supplementary Information only).
+
+```{r suppleme-01}
+# serum limma results from the serum section (the objects were overwritten by later limma runs)
+res_steatosis <- serum_limma$Steatosis; res_inflammation <- serum_limma$Inflammation; res_fibrosis <- serum_limma$Fibrosis
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+required_packages <- c(
+  "openxlsx",
+  "limma",
+  "dplyr",
+  "stringr",
+  "tibble"
+)
+for (pkg in required_packages) {
+
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+
+    install.packages(pkg)
+
+  }
+
+}
+library(openxlsx)
+library(limma)
+library(dplyr)
+library(stringr)
+library(tibble)
+# ============================================================
+# 2. SETTINGS
+# ============================================================
+FDR_OMICS <- 0.10
+METABO_FILE <- file.path(project_dir, "Analyisis/ST001711_AN002786.txt")   # Metabolomics Workbench ST001711 (AN002786)
+# ============================================================
+# 3. BASIC HELPER FUNCTIONS
+# ============================================================
+safe_numeric <- function(x) {
+
+  suppressWarnings(
+    as.numeric(
+      as.character(x)
+    )
+  )
+
+}
+normalise_name <- function(x) {
+
+  x <- toupper(
+    trimws(
+      as.character(x)
+    )
+  )
+
+  gsub(
+    "[^A-Z0-9]",
+    "",
+    x
+  )
+
+}
+first_existing_column <- function(
+    df,
+    candidates
+) {
+
+  hits <- candidates[
+    candidates %in% names(df)
+  ]
+
+  if (length(hits) == 0) {
+
+    return(NULL)
+
+  }
+
+  hits[1]
+
+}
+# ============================================================
+# 4. CHECK INPUT FILES
+# ============================================================
+if (!file.exists(METABO_FILE)) {
+
+  stop(
+    "\nMetabolomics file not found:\n",
+    METABO_FILE,
+    "\n\nPlace ST001711_AN002786.txt in data/Analyisis/ (Metabolomics Workbench)."
+  )
+
+}
+cat(
+  "\nCurrent working directory:\n",
+  getwd(),
+  "\n"
+)
+# ============================================================
+# 5. CHECK SERUM DISCOVERY OBJECTS
+# ============================================================
+required_serum_objects <- c(
+  "res_steatosis",
+  "res_inflammation",
+  "res_fibrosis"
+)
+missing_serum_objects <-
+  required_serum_objects[
+    !vapply(
+      required_serum_objects,
+      exists,
+      logical(1),
+      inherits = TRUE
+    )
+  ]
+if (
+  length(missing_serum_objects) > 0
+) {
+
+  stop(
+    "\nMissing serum discovery objects:\n\n",
+    paste(
+      missing_serum_objects,
+      collapse = "\n"
+    ),
+    "\n\nRun your final serum discovery analyses first."
+  )
+
+}
+# ============================================================
+# 6. EPoS MWTAB IMPORTER
+# ============================================================
+#
+# Important:
+#
+# Main data block:
+#
+#   Samples
+#   Factors
+#   feature rows...
+#
+# SUBJECT_SAMPLE_FACTORS:
+#
+#   x[1] = SUBJECT_SAMPLE_FACTORS
+#   x[2] = -
+#   x[3] = SAMPLE ID
+#   x[4] = FACTORS
+#   x[5+] = CLINICAL DATA
+#
+# Metadata can use:
+#
+#   Kleiner.Steatosis:1
+#   Inflammation:1
+#   Kleiner.Fibrosis=1a
+#   NAS=4
+#
+# ============================================================
+read_epos_mwtab <- function(file) {
+
+  cat(
+    "\nReading:",
+    file,
+    "\n"
+  )
+
+  lines <- readLines(
+    file,
+    encoding = "UTF-8",
+    warn = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # Locate data block
+  # ----------------------------------------------------------
+
+  start_idx <- which(
+    trimws(lines) ==
+      "MS_METABOLITE_DATA_START"
+  )
+
+  end_idx <- which(
+    trimws(lines) ==
+      "MS_METABOLITE_DATA_END"
+  )
+
+  if (
+    length(start_idx) != 1 ||
+    length(end_idx) != 1 ||
+    end_idx <= start_idx
+  ) {
+
+    stop(
+      "\nCould not locate MS_METABOLITE_DATA_START/END in ",
+      file
+    )
+
+  }
+
+  # ----------------------------------------------------------
+  # Samples header
+  # ----------------------------------------------------------
+
+  header <- strsplit(
+    lines[start_idx + 1],
+    "\t",
+    fixed = TRUE
+  )[[1]]
+
+  if (
+    length(header) < 2 ||
+    trimws(header[1]) != "Samples"
+  ) {
+
+    stop(
+      "\nUnexpected Samples header in ",
+      file
+    )
+
+  }
+
+  sample_ids <- trimws(
+    header[-1]
+  )
+
+  # ----------------------------------------------------------
+  # Features
+  #
+  # start + 1 = Samples
+  # start + 2 = Factors
+  # start + 3 = first feature
+  # ----------------------------------------------------------
+
+  data_lines <- lines[
+    (start_idx + 3):(end_idx - 1)
+  ]
+
+  data_lines <- data_lines[
+    nzchar(
+      trimws(data_lines)
+    )
+  ]
+
+  if (
+    length(data_lines) == 0
+  ) {
+
+    stop(
+      "\nNo feature rows found in ",
+      file
+    )
+
+  }
+
+  # ----------------------------------------------------------
+  # Parse rows
+  # ----------------------------------------------------------
+
+  parsed <- lapply(
+    data_lines,
+    function(z) {
+
+      x <- strsplit(
+        z,
+        "\t",
+        fixed = TRUE
+      )[[1]]
+
+      if (
+        length(x) < length(header)
+      ) {
+
+        x <- c(
+          x,
+          rep(
+            NA_character_,
+            length(header) -
+              length(x)
+          )
+        )
+
+      }
+
+      if (
+        length(x) > length(header)
+      ) {
+
+        x <- x[
+          seq_len(
+            length(header)
+          )
+        ]
+
+      }
+
+      x
+
+    }
+  )
+
+  # ----------------------------------------------------------
+  # Feature names
+  # ----------------------------------------------------------
+
+  feature_names <- vapply(
+    parsed,
+    function(z) {
+
+      trimws(
+        z[1]
+      )
+
+    },
+    character(1)
+  )
+
+  if (
+    any(
+      is.na(feature_names) |
+      feature_names == ""
+    )
+  ) {
+
+    stop(
+      "\nMissing feature name in ",
+      file
+    )
+
+  }
+
+  # ----------------------------------------------------------
+  # Numeric matrix
+  # ----------------------------------------------------------
+
+  value_mat <- matrix(
+    NA_real_,
+    nrow = length(parsed),
+    ncol = length(sample_ids)
+  )
+
+  for (i in seq_along(parsed)) {
+
+    value_mat[i, ] <- suppressWarnings(
+      as.numeric(
+        parsed[[i]][-1]
+      )
+    )
+
+  }
+
+  rownames(value_mat) <- make.unique(
+    feature_names
+  )
+
+  colnames(value_mat) <- sample_ids
+
+  # ==========================================================
+  # SAMPLE METADATA
+  # ==========================================================
+
+  factor_idx <- which(
+    grepl(
+      "^SUBJECT_SAMPLE_FACTORS\\s",
+      lines
+    )
+  )
+
+  if (
+    length(factor_idx) == 0
+  ) {
+
+    stop(
+      "\nNo SUBJECT_SAMPLE_FACTORS records found in ",
+      file
+    )
+
+  }
+
+  metadata <- tibble(
+    SampleID = sample_ids,
+    Factors = NA_character_,
+    Clinical = NA_character_
+  )
+
+  for (idx in factor_idx) {
+
+    x <- strsplit(
+      lines[idx],
+      "\t",
+      fixed = TRUE
+    )[[1]]
+
+    if (
+      length(x) < 4
+    ) {
+
+      next
+
+    }
+
+    # IMPORTANT:
+    # Sample ID = x[3]
+    sid <- trimws(
+      x[3]
+    )
+
+    if (
+      is.na(sid) ||
+      !sid %in% metadata$SampleID
+    ) {
+
+      next
+
+    }
+
+    pos <- match(
+      sid,
+      metadata$SampleID
+    )
+
+    metadata$Factors[pos] <-
+      trimws(
+        x[4]
+      )
+
+    if (
+      length(x) >= 5
+    ) {
+
+      metadata$Clinical[pos] <-
+        paste(
+          x[5:length(x)],
+          collapse = " | "
+        )
+
+    }
+
+  }
+
+  # ==========================================================
+  # FIELD EXTRACTION
+  # ==========================================================
+
+  extract_field <- function(
+    factors,
+    clinical,
+    key
+  ) {
+
+    txt <- paste(
+      ifelse(
+        is.na(factors),
+        "",
+        factors
+      ),
+      ifelse(
+        is.na(clinical),
+        "",
+        clinical
+      ),
+      sep = " | "
+    )
+
+    pattern <- paste0(
+      "(?:^|[|;[:space:]])",
+      key,
+      "\\s*[:=]\\s*",
+      "([^|;[:space:]]+)"
+    )
+
+    out <- stringr::str_match(
+      txt,
+      pattern
+    )[, 2]
+
+    out[
+      is.na(out) |
+        out %in% c(
+          "",
+          "-",
+          "NA",
+          "NaN"
+        )
+    ] <- NA_character_
+
+    out
+
+  }
+
+  # ----------------------------------------------------------
+  # Raw fields
+  # ----------------------------------------------------------
+
+  metadata$Steatosis_raw <-
+    extract_field(
+      metadata$Factors,
+      metadata$Clinical,
+      "Kleiner\\.Steatosis"
+    )
+
+  metadata$Inflammation_raw <-
+    extract_field(
+      metadata$Factors,
+      metadata$Clinical,
+      "Inflammation"
+    )
+
+  metadata$Fibrosis_raw <-
+    extract_field(
+      metadata$Factors,
+      metadata$Clinical,
+      "Kleiner\\.Fibrosis"
+    )
+
+  metadata$NAS_raw <-
+    extract_field(
+      metadata$Factors,
+      metadata$Clinical,
+      "NAS"
+    )
+
+  # ----------------------------------------------------------
+  # Numeric variables
+  # ----------------------------------------------------------
+
+  metadata$Steatosis <-
+    safe_numeric(
+      metadata$Steatosis_raw
+    )
+
+  metadata$Inflammation <-
+    safe_numeric(
+      metadata$Inflammation_raw
+    )
+
+  metadata$NAS <-
+    safe_numeric(
+      metadata$NAS_raw
+    )
+
+  # ----------------------------------------------------------
+  # Fibrosis mapping
+  #
+  # 1 / 1a / 1b / 1c -> 1
+  # 2 -> 2
+  # 3 -> 3
+  # 4 -> 4
+  # 6 -> NA
+  # ----------------------------------------------------------
+
+  metadata$Fibrosis <-
+    dplyr::case_when(
+
+      metadata$Fibrosis_raw %in%
+        c(
+          "1",
+          "1a",
+          "1b",
+          "1c"
+        ) ~ 1,
+
+      metadata$Fibrosis_raw == "2" ~
+        2,
+
+      metadata$Fibrosis_raw == "3" ~
+        3,
+
+      metadata$Fibrosis_raw == "4" ~
+        4,
+
+      TRUE ~
+        NA_real_
+
+    )
+
+  # ----------------------------------------------------------
+  # Safety checks
+  # ----------------------------------------------------------
+
+  if (
+    ncol(value_mat) != 627
+  ) {
+
+    stop(
+      "\nExpected 627 samples in ",
+      file,
+      ", found ",
+      ncol(value_mat)
+    )
+
+  }
+
+  if (
+    !identical(
+      colnames(value_mat),
+      metadata$SampleID
+    )
+  ) {
+
+    stop(
+      "\nMatrix and metadata sample IDs do not match in ",
+      file
+    )
+
+  }
+
+  list(
+    matrix = value_mat,
+    metadata = metadata
+  )
+
+}
+# ============================================================
+# 7. READ EPoS FILES
+# ============================================================
+epos_metabo <-
+  read_epos_mwtab(
+    METABO_FILE
+  )
+metabo_matrix <-
+  epos_metabo$matrix
+pheno_metabo <-
+  epos_metabo$metadata
+# ------------------------------------------------------------
+# Dimensions
+# ------------------------------------------------------------
+cat(
+  "\n============================================\n",
+  "EPoS DIMENSIONS\n",
+  "============================================\n",
+  sep = ""
+)
+cat(
+  "\nMetabolomics:",
+  nrow(metabo_matrix),
+  "features x",
+  ncol(metabo_matrix),
+  "samples\n"
+)
+# HARD CHECKS
+if (
+  nrow(metabo_matrix) != 36
+) {
+
+  stop(
+    "Metabolomics should contain 36 features; found ",
+    nrow(metabo_matrix)
+  )
+
+}
+# ============================================================
+# 8. METADATA CHECK
+# ============================================================
+cat(
+  "\n============================================\n",
+  "EPoS METADATA CHECK\n",
+  "============================================\n",
+  sep = ""
+)
+cat(
+  "\nSTEATOSIS:\n"
+)
+print(
+  table(
+    pheno_metabo$Steatosis,
+    useNA = "ifany"
+  )
+)
+cat(
+  "\nINFLAMMATION:\n"
+)
+print(
+  table(
+    pheno_metabo$Inflammation,
+    useNA = "ifany"
+  )
+)
+cat(
+  "\nFIBROSIS:\n"
+)
+print(
+  table(
+    pheno_metabo$Fibrosis,
+    useNA = "ifany"
+  )
+)
+# ============================================================
+# 9. HARD-CHECK EXPECTED ANALYSIS GROUPS
+# ============================================================
+# Steatosis: 212 vs 388
+if (
+  sum(
+    pheno_metabo$Steatosis == 1,
+    na.rm = TRUE
+  ) != 212 ||
+  sum(
+    pheno_metabo$Steatosis %in%
+    c(2, 3, 4),
+    na.rm = TRUE
+  ) != 388
+) {
+
+  stop(
+    "\nSteatosis groups are not 212 / 388."
+  )
+
+}
+# Inflammation: 307 vs 247
+if (
+  sum(
+    pheno_metabo$Inflammation == 1,
+    na.rm = TRUE
+  ) != 307 ||
+  sum(
+    pheno_metabo$Inflammation %in%
+    c(2, 3, 4),
+    na.rm = TRUE
+  ) != 247
+) {
+
+  stop(
+    "\nInflammation groups are not 307 / 247."
+  )
+
+}
+# Fibrosis: 157 vs 293
+if (
+  sum(
+    pheno_metabo$Fibrosis == 1,
+    na.rm = TRUE
+  ) != 157 ||
+  sum(
+    pheno_metabo$Fibrosis %in%
+    c(2, 3, 4),
+    na.rm = TRUE
+  ) != 293
+) {
+
+  stop(
+    "\nFibrosis groups are not 157 / 293."
+  )
+
+}
+cat(
+  "\nEPoS metadata checks PASSED.\n"
+)
+# ============================================================
+# 10. EXTERNAL BINARY limma
+# ============================================================
+#
+# Grade 1 vs Grades 2+3+4
+#
+# EPoS data are already log2-transformed and scaled.
+# No extra normalization is performed.
+# ============================================================
+run_external_binary <- function(
+    matrix_data,
+    phenotype,
+    fdr = 0.10
+) {
+
+  if (
+    length(phenotype) !=
+    ncol(matrix_data)
+  ) {
+
+    stop(
+      "\nPhenotype length does not match matrix sample number."
+    )
+
+  }
+
+  grp <- rep(
+    NA_character_,
+    length(phenotype)
+  )
+
+  grp[
+    phenotype == 1
+  ] <- "Grade1"
+
+  grp[
+    phenotype %in%
+      c(
+        2,
+        3,
+        4
+      )
+  ] <- "Grade2_3_4"
+
+  keep <- !is.na(
+    grp
+  )
+
+  grp <- factor(
+    grp[keep],
+    levels = c(
+      "Grade1",
+      "Grade2_3_4"
+    )
+  )
+
+  x <- matrix_data[
+    ,
+    keep,
+    drop = FALSE
+  ]
+
+  if (
+    any(
+      table(grp) == 0
+    )
+  ) {
+
+    stop(
+      "\nOne analysis group contains zero samples."
+    )
+
+  }
+
+  design <- model.matrix(
+    ~ grp
+  )
+
+  fit <- limma::lmFit(
+    x,
+    design
+  )
+
+  fit <- limma::eBayes(
+    fit
+  )
+
+  tt <- limma::topTable(
+    fit,
+    coef = "grpGrade2_3_4",
+    number = Inf,
+    adjust.method = "fdr",
+    sort.by = "P"
+  )
+
+  tt$Feature <-
+    rownames(
+      tt
+    )
+
+  tt$Direction <-
+    ifelse(
+      tt$logFC > 0,
+      "Up",
+      ifelse(
+        tt$logFC < 0,
+        "Down",
+        "Zero"
+      )
+    )
+
+  tt$Significant <-
+    !is.na(
+      tt$adj.P.Val
+    ) &
+    tt$adj.P.Val <= fdr
+
+  list(
+    result = tt,
+    n_grade1 =
+      sum(
+        grp == "Grade1"
+      ),
+    n_grade234 =
+      sum(
+        grp == "Grade2_3_4"
+      )
+  )
+
+}
+# ============================================================
+# 11. EXTERNAL METABOLOMICS
+# ============================================================
+cat(
+  "\n============================================\n",
+  "EXTERNAL SERUM METABOLOMICS\n",
+  "============================================\n",
+  sep = ""
+)
+res_metabo_steatosis <-
+  run_external_binary(
+    metabo_matrix,
+    pheno_metabo$Steatosis,
+    FDR_OMICS
+  )
+res_metabo_inflammation <-
+  run_external_binary(
+    metabo_matrix,
+    pheno_metabo$Inflammation,
+    FDR_OMICS
+  )
+res_metabo_fibrosis <-
+  run_external_binary(
+    metabo_matrix,
+    pheno_metabo$Fibrosis,
+    FDR_OMICS
+  )
+cat(
+  "\nSteatosis:",
+  res_metabo_steatosis$n_grade1,
+  "vs",
+  res_metabo_steatosis$n_grade234,
+  "\n"
+)
+cat(
+  "Significant:",
+  sum(
+    res_metabo_steatosis$result$Significant
+  ),
+  "\n"
+)
+cat(
+  "\nInflammation:",
+  res_metabo_inflammation$n_grade1,
+  "vs",
+  res_metabo_inflammation$n_grade234,
+  "\n"
+)
+cat(
+  "Significant:",
+  sum(
+    res_metabo_inflammation$result$Significant
+  ),
+  "\n"
+)
+cat(
+  "\nFibrosis:",
+  res_metabo_fibrosis$n_grade1,
+  "vs",
+  res_metabo_fibrosis$n_grade234,
+  "\n"
+)
+cat(
+  "Significant:",
+  sum(
+    res_metabo_fibrosis$result$Significant
+  ),
+  "\n"
+)
+# Expected:
+#
+# Steatosis      0
+# Inflammation   6
+# Fibrosis       0
+# ============================================================
+# 12. DISCOVERY METABOLOMICS
+# ============================================================
+#
+# CURRENT FINAL WORKSPACE RESULTS:
+#
+# Steatosis      12
+# Inflammation    4
+# Fibrosis        0
+#
+# ============================================================
+flatten_metabo <- function(
+    x,
+    phenotype,
+    fdr = 0.10
+) {
+
+  x <- as.data.frame(
+    x
+  )
+
+  if (
+    !all(
+      c(
+        "logFC",
+        "adj.P.Val"
+      ) %in%
+      names(x)
+    )
+  ) {
+
+    stop(
+      "\nDiscovery metabolomics result does not contain ",
+      "logFC and adj.P.Val."
+    )
+
+  }
+
+  sig_idx <- which(
+    !is.na(
+      x$adj.P.Val
+    ) &
+      x$adj.P.Val <= fdr
+  )
+
+  feature <- rownames(
+    x
+  )
+
+  if (
+    "Feature" %in%
+    names(x)
+  ) {
+
+    feature <- as.character(
+      x$Feature
+    )
+
+  }
+
+  if (
+    "Metabolite" %in%
+    names(x)
+  ) {
+
+    feature <- as.character(
+      x$Metabolite
+    )
+
+  }
+
+  feature <- feature[
+    sig_idx
+  ]
+
+  out <- data.frame(
+
+    Feature =
+      as.character(
+        feature
+      ),
+
+    Discovery_logFC =
+      as.numeric(
+        x$logFC[sig_idx]
+      ),
+
+    Discovery_FDR =
+      as.numeric(
+        x$adj.P.Val[sig_idx]
+      ),
+
+    Phenotype =
+      rep(
+        as.character(phenotype),
+        length(sig_idx)
+      ),
+
+    stringsAsFactors = FALSE
+
+  )
+
+  out$Discovery_Direction <-
+    ifelse(
+      out$Discovery_logFC > 0,
+      "Up",
+      ifelse(
+        out$Discovery_logFC < 0,
+        "Down",
+        "Zero"
+      )
+    )
+
+  out$Feature_norm <-
+    normalise_name(
+      out$Feature
+    )
+
+  out
+
+}
+disc_steatosis <-
+  flatten_metabo(
+    res_steatosis,
+    "Steatosis",
+    FDR_OMICS
+  )
+disc_inflammation <-
+  flatten_metabo(
+    res_inflammation,
+    "Inflammation",
+    FDR_OMICS
+  )
+disc_fibrosis <-
+  flatten_metabo(
+    res_fibrosis,
+    "Fibrosis",
+    FDR_OMICS
+  )
+disc_metabo <- rbind(
+  disc_steatosis,
+  disc_inflammation,
+  disc_fibrosis
+)
+rownames(
+  disc_metabo
+) <- NULL
+# ------------------------------------------------------------
+# Hard check current discovery results
+# ------------------------------------------------------------
+cat(
+  "\n============================================\n",
+  "DISCOVERY SERUM METABOLOMICS\n",
+  "============================================\n",
+  sep = ""
+)
+cat(
+  "\nSteatosis:",
+  nrow(disc_steatosis),
+  "\n"
+)
+cat(
+  "Inflammation:",
+  nrow(disc_inflammation),
+  "\n"
+)
+cat(
+  "Fibrosis:",
+  nrow(disc_fibrosis),
+  "\n"
+)
+if (
+  nrow(disc_steatosis) != 12
+) {
+
+  stop(
+    "\nCurrent res_steatosis contains ",
+    nrow(disc_steatosis),
+    " significant metabolites, not 12."
+  )
+
+}
+if (
+  nrow(disc_inflammation) != 4
+) {
+
+  stop(
+    "\nCurrent res_inflammation contains ",
+    nrow(disc_inflammation),
+    " significant metabolites, not 4."
+  )
+
+}
+if (
+  nrow(disc_fibrosis) != 0
+) {
+
+  stop(
+    "\nCurrent res_fibrosis contains ",
+    nrow(disc_fibrosis),
+    " significant metabolites, not 0."
+  )
+
+}
+# ============================================================
+# 13. METABOLOMICS FEATURE MATCHING
+# ============================================================
+external_metabo_lookup <- data.frame(
+
+  External_feature =
+    as.character(
+      rownames(
+        metabo_matrix
+      )
+    ),
+
+  stringsAsFactors = FALSE
+
+)
+external_metabo_lookup$Feature_norm <-
+  normalise_name(
+    external_metabo_lookup$External_feature
+  )
+# ------------------------------------------------------------
+# Exact aliases
+# ------------------------------------------------------------
+disc_metabo$Feature_norm[
+  disc_metabo$Feature ==
+    "GLUTAMIC_ACID"
+] <- "GLUTAMICACID"
+disc_metabo$Feature_norm[
+  disc_metabo$Feature ==
+    "ISOLEUCINE"
+] <- "ISOLEUCINE"
+# ------------------------------------------------------------
+# Match discovery metabolites to external measured features
+# ------------------------------------------------------------
+metabo_feature_table <- merge(
+
+  disc_metabo,
+
+  external_metabo_lookup,
+
+  by = "Feature_norm",
+
+  all.x = TRUE,
+
+  sort = FALSE
+
+)
+metabo_feature_table$Measured_externally <-
+  !is.na(
+    metabo_feature_table$External_feature
+  )
+# ============================================================
+# 14. ADD EXTERNAL METABOLOMICS STATISTICS
+# ============================================================
+external_metabo_results <- rbind(
+
+  data.frame(
+
+    Phenotype =
+      "Steatosis",
+
+    External_feature =
+      as.character(
+        res_metabo_steatosis$result$Feature
+      ),
+
+    External_logFC =
+      res_metabo_steatosis$result$logFC,
+
+    External_FDR =
+      res_metabo_steatosis$result$adj.P.Val,
+
+    stringsAsFactors = FALSE
+
+  ),
+
+  data.frame(
+
+    Phenotype =
+      "Inflammation",
+
+    External_feature =
+      as.character(
+        res_metabo_inflammation$result$Feature
+      ),
+
+    External_logFC =
+      res_metabo_inflammation$result$logFC,
+
+    External_FDR =
+      res_metabo_inflammation$result$adj.P.Val,
+
+    stringsAsFactors = FALSE
+
+  ),
+
+  data.frame(
+
+    Phenotype =
+      "Fibrosis",
+
+    External_feature =
+      as.character(
+        res_metabo_fibrosis$result$Feature
+      ),
+
+    External_logFC =
+      res_metabo_fibrosis$result$logFC,
+
+    External_FDR =
+      res_metabo_fibrosis$result$adj.P.Val,
+
+    stringsAsFactors = FALSE
+
+  )
+
+)
+# ------------------------------------------------------------
+# Match external statistics
+# ------------------------------------------------------------
+metabo_feature_table <- merge(
+
+  metabo_feature_table,
+
+  external_metabo_results,
+
+  by = c(
+    "Phenotype",
+    "External_feature"
+  ),
+
+  all.x = TRUE,
+
+  sort = FALSE
+
+)
+metabo_feature_table$External_Direction <-
+  ifelse(
+
+    metabo_feature_table$External_logFC > 0,
+
+    "Up",
+
+    ifelse(
+
+      metabo_feature_table$External_logFC < 0,
+
+      "Down",
+
+      NA_character_
+
+    )
+
+  )
+metabo_feature_table$Direction_concordant <-
+  ifelse(
+
+    !metabo_feature_table$Measured_externally,
+
+    NA,
+
+    metabo_feature_table$Discovery_Direction ==
+      metabo_feature_table$External_Direction
+
+  )
+# ============================================================
+# 15. TABLE S13A
+# ============================================================
+make_metabo_summary <- function(
+    phenotype,
+    feature_table,
+    external_result
+) {
+
+  z <- feature_table[
+    feature_table$Phenotype ==
+      phenotype,
+    ,
+    drop = FALSE
+  ]
+
+  measured <- sum(
+    z$Measured_externally,
+    na.rm = TRUE
+  )
+
+  same <- sum(
+    z$Direction_concordant %in%
+      TRUE
+  )
+
+  opposite <- sum(
+    z$Direction_concordant %in%
+      FALSE
+  )
+
+  not_measured <- sum(
+    !z$Measured_externally
+  )
+
+  data.frame(
+
+    Phenotype =
+      phenotype,
+
+    Contrast =
+      "Grade 1 vs Grades 2+3+4",
+
+    Discovery_significant =
+      nrow(z),
+
+    External_significant =
+      sum(
+        external_result$result$Significant
+      ),
+
+    Measured_externally =
+      measured,
+
+    Same_direction =
+      same,
+
+    Opposite_direction =
+      opposite,
+
+    Not_measured =
+      not_measured,
+
+    Percent_concordant =
+      if (
+        measured > 0
+      ) {
+
+        100 *
+          same /
+          measured
+
+      } else {
+
+        NA_real_
+
+      },
+
+    stringsAsFactors = FALSE
+
+  )
+
+}
+Table_S13A <- rbind(
+
+  make_metabo_summary(
+    "Steatosis",
+    metabo_feature_table,
+    res_metabo_steatosis
+  ),
+
+  make_metabo_summary(
+    "Inflammation",
+    metabo_feature_table,
+    res_metabo_inflammation
+  ),
+
+  make_metabo_summary(
+    "Fibrosis",
+    metabo_feature_table,
+    res_metabo_fibrosis
+  )
+
+)
+# ============================================================
+# 16. TABLE S13B
+# ============================================================
+Table_S13B <- metabo_feature_table[
+  ,
+  c(
+
+    "Phenotype",
+
+    "Feature",
+
+    "External_feature",
+
+    "Discovery_logFC",
+
+    "Discovery_FDR",
+
+    "Discovery_Direction",
+
+    "External_logFC",
+
+    "External_FDR",
+
+    "External_Direction",
+
+    "Measured_externally",
+
+    "Direction_concordant"
+
+  ),
+  drop = FALSE
+]
+Table_S13B <- Table_S13B[
+  order(
+    Table_S13B$Phenotype,
+    Table_S13B$Feature
+  ),
+  ,
+  drop = FALSE
+]
+cat(
+  "\n============================================\n",
+  "TABLE S13A\n",
+  "============================================\n",
+  sep = ""
+)
+print(
+  Table_S13A,
+  row.names = FALSE
+)
+
+```
+
+## Tables S19 and S20
+
+```{r suppleme-02, message=FALSE, warning=FALSE}
+add_table("Table S19", setNames(Table_S13A, gsub("_", " ", names(Table_S13A))))
+add_table("Table S20", setNames(Table_S13B, gsub("_", " ", names(Table_S13B))))
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Supp_EPoS_serum_validation")   # lets the next step start from here
+```
