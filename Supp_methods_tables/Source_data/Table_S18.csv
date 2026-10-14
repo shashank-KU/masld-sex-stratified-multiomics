@@ -1,0 +1,5 @@
+﻿Cohort / dataset,Molecular layer,Tissue / compartment,Study reference (PMID),Link for dataset,External validation phenotype / contrast,Purpose
+GSE162694,Transcriptomics,Liver biopsy,34508113,https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE162694,Fibrosis: F0 vs F1–F4; Steatosis and inflammation: NAS-based analyses,Independent liver transcriptomic validation
+GSE135251,Transcriptomics,Liver biopsy,33268509,https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE135251,Fibrosis: F0 vs F1–F4; Steatosis and inflammation: NAS-based,Independent liver transcriptomic validation
+EPoS cohort (ST001711),Polar metabolomics,Serum,35434590,https://www.metabolomicsworkbench.org/data/DRCCMetadata.php?Mode=Study&StudyID=ST001711&StudyType=MS&ResultType=1,Steatosis: Grade 1 vs Grades 2–3; Inflammation: Grade 1 vs Grades 2–3; Fibrosis: Stage 1 vs Stages 2–4,Independent serum metabolomics validation (reported in the Supplementary Information only)
+ST000915,Lipidomics,Liver biopsy,25598080,https://www.metabolomicsworkbench.org/data/DRCCMetadata.php?Mode=Study&StudyID=ST000915,Normal vs Steatosis,Independent liver lipidomics validation

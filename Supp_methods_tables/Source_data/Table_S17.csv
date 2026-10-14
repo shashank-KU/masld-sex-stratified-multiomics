@@ -1,0 +1,13 @@
+﻿Conditions,Polar/semipolar compounds: Method 1,,Lipidomics: Method 2
+Injection volume,10 µl,,1 µl
+Column,"C18 precolumn (Waters Corporation, Wexford, Ireland) and an inline filter, pore size 0.2 µm (Waters Corporation, Wexford, Ireland). + ACQUITY UPLC® BEH C18 column (2.1 mm × 100 mm, particle size 1.7 µm) by Waters (Milford, MA, USA)",,"C18 precolumn (Waters Corporation, Wexford, Ireland) and an inline filter, pore size 0.2 µm (Waters Corporation, Wexford, Ireland). + ACQUITY UPLC® BEH C18 column (2.1 mm × 100 mm, particle size 1.7 µm) by Waters (Milford, MA, USA)"
+Mobile phases,A H2O:MeOH (v/v 70:30) with 2 mM ammonium acetate,,A 10 mM ammonium acetate and 0.1 % Formic Acid in H2O
+,B MeOH containing 2 mM ammonium acetate,,B Acetonitrile:Isopropanol (v/v 1:1) with 0.1 % Formic Acid and 10 mM ammonium acetate
+Gradient,•0–1.5 min: B was increased from 5 % to 30 %,,"•0–2 min, B was increased from 35 % to 80 %"
+,•1.5–4.5 min,,"•2–7 min, B increased to 100 %"
+,•B increased to 70 %.,,"•7–14 min, B was held at 100 %."
+,•4.5–7.5 min,,•A post-time of 7 min
+,•B increased to 100 % and held for 5.5 min.,,
+,•A post-time of 6 min,,
+Flow rate,0.4 mL min⁻¹,,0.4 mL min⁻¹
+MS conditions,"Dual ESI ionization source with capillary voltage 4.5 kV, nozzle voltage 1500 V, N2 pressure in the nebulizer was 21 psi and the N2 flow rate and temperature as sheath gas was 11 L min⁻¹ and 379 °C, respectively. Drying gas flow was set to 10 L min⁻¹ and temperature to 150 °C. m/z range 100–1700 in negative ion mode.",,"Dual ESI ionization source with capillary voltage 3.64 kV, nozzle voltage 1500 V, N2 pressure in the nebulizer was 21 psi and the N2 flow rate and temperature as sheath gas was 11 L min⁻¹ and 379 °C, respectively. Drying gas flow was set to 10 L min⁻¹ and temperature to 193 °C. m/z range 100–1700 in positive ion mode"
