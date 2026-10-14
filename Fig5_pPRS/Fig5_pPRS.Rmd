@@ -1,0 +1,455 @@
+---
+title: "Fig. 5: partitioned polygenic risk scores (Table S12)"
+author: "Shashank Gupta"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Fig5_pPRS.Rmd")` from this folder). It first loads the workspace of the previous step (`Fig4_paired_liver_serum`), running that script if needed. Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
+}
+source(file.path(.root, "common", "setup.R"))
+```
+
+```{r prereq, include=FALSE}
+load_prereq("Fig4_paired_liver_serum")   # loads the workspace of the previous step (or runs it first)
+```
+
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Fig5_pPRS")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Partitioned polygenic risk scores: Fig. 5 and Table S12
+
+pPRS, liver-serum uncoupling and mediation through hepatic triglycerides.
+
+```{r partitio-01}
+## =====================================================================
+##  Partitioned polygenic risk scores (pPRS) and liver–serum uncoupling
+##
+##  RUN THIS IN THE SAME R SESSION, RIGHT AFTER Robustness_liver_serum_v2.R
+##  (it reuses: meta, df, paired, Lp, Sp, Ll, zL, zS, D, panel, tg_cols,
+##   run_limma, cv_auc, Xclin, BASE, TRAITS, KEY6, extra_ok, FDR, N_REP)
+##
+##  Step 1  sanity check: do the scores behave as expected?
+##          (discordant: liver TG up, serum TG down; concordant: both up)
+##  Step 2  pPRS as covariates (answers the PNPLA3/TM6SF2 reviewer point)
+##  Step 3  does genetic hepatic lipid retention (discordant pPRS)
+##          uncouple liver and serum?
+##            3a  liver–serum correlation of the same metabolite, low vs high pPRS
+##            3b  liver TG vs serum TG coupling x pPRS interaction
+##            3c  liver-minus-serum gap vs pPRS
+##            3d  serum AUC for histology, low vs high pPRS
+##  Step 4  genetic mediation: pPRS -> hepatic TG -> histology
+##
+##  Output: pprs_liver_serum/  -> all CSVs + summary_pprs.txt
+## =====================================================================
+need <- c("meta", "df", "paired", "Lp", "Sp", "Ll", "zL", "zS", "D", "panel",
+          "tg_cols", "run_limma", "cv_auc", "Xclin", "BASE", "TRAITS", "KEY6")
+miss <- need[!vapply(need, exists, logical(1))]
+if (length(miss)) stop("run Robustness_liver_serum_v2.R first; missing: ", paste(miss, collapse = ", "))
+if (!exists("extra_ok")) extra_ok <- character(0)
+suppressPackageStartupMessages({ library(readxl); library(pROC); library(mediation) })
+set.seed(20260921)
+OUTP <- "pprs_liver_serum"; dir.create(OUTP, showWarnings = FALSE)
+PPRS_FILE <- file.path(project_dir, "PRS_analysis/pprs.xlsx")
+N_PERM <- 2000        # permutations for step 3a
+N_BOOT <- 2000        # bootstrap resamples for mediation (step 4)
+## ---------------------------------------------------------------------
+## 0. read pPRS, match IDs (MF1 -> LIVMF1), standardise
+## ---------------------------------------------------------------------
+pp <- as.data.frame(read_excel(PPRS_FILE))
+names(pp) <- trimws(names(pp))
+pp$id <- ifelse(grepl("^LIV", pp$ID), pp$ID, paste0("LIV", pp$ID))
+cat("pPRS rows:", nrow(pp), "| matching metadata:", sum(pp$id %in% meta$id),
+    "| matching paired set:", sum(pp$id %in% paired), "\n")
+zsc <- function(v) as.numeric(scale(v))
+meta$pprs_conc <- zsc(as.numeric(pp$Concordant)[match(meta$id, pp$id)])
+meta$pprs_disc <- zsc(as.numeric(pp$Discordant)[match(meta$id, pp$id)])
+df$pprs_conc <- meta$pprs_conc[match(rownames(df), meta$id)]
+df$pprs_disc <- meta$pprs_disc[match(rownames(df), meta$id)]
+cat("correlation concordant vs discordant pPRS:",
+    round(cor(meta$pprs_conc, meta$pprs_disc, use = "complete"), 2), "\n")
+## hepatic TG index for everyone with lipidomics (same definition as v2)
+TG_all <- rowMeans(scale(Ll[, tg_cols]), na.rm = TRUE)
+meta$TG_liver <- zsc(TG_all[meta$id])
+meta$TG_serum <- zsc(log(as.numeric(meta$TG_mgdL)))
+meta$steat_grade <- as.numeric(meta$steatosis_Kleiner)
+meta$NAS <- as.numeric(meta$NAS_score)
+## ---------------------------------------------------------------------
+## 1. sanity check (linear models adjusted for age, sex, BMI)
+## ---------------------------------------------------------------------
+assoc <- function(y, x, data, covs = BASE) {
+  d <- data[, c(y, x, covs)]; d <- d[complete.cases(d), ]
+  s <- summary(lm(reformulate(c(x, covs), y), d))$coefficients[x, ]
+  data.frame(outcome = y, pPRS = x, n = nrow(d), beta_per_SD = round(s[1], 3),
+             SE = round(s[2], 3), p = signif(s[4], 3), row.names = NULL)
+}
+s1 <- do.call(rbind, lapply(c("TG_liver", "TG_serum", "steat_grade", "NAS"), function(y)
+  rbind(assoc(y, "pprs_conc", meta), assoc(y, "pprs_disc", meta))))
+s1$expected_sign <- with(s1, ifelse(outcome == "TG_serum" & pPRS == "pprs_disc", "-", "+"))
+s1$as_expected <- sign(s1$beta_per_SD) == ifelse(s1$expected_sign == "+", 1, -1)
+write.csv(s1, file.path(OUTP, "1_sanity_check.csv"), row.names = FALSE)
+cat("\n== Step 1: sanity check ==\n"); print(s1, row.names = FALSE)
+## ---------------------------------------------------------------------
+## 2. pPRS as covariates in the paired analysis
+## ---------------------------------------------------------------------
+cov_sets <- list(
+  base               = BASE,
+  pPRS               = c(BASE, "pprs_conc", "pprs_disc"),
+  pPRS_TG_glycaemia  = c(BASE, "pprs_conc", "pprs_disc", "TG_index", extra_ok))
+s2 <- list(); s2aa <- list()
+for (cn in names(cov_sets)) for (t in TRAITS) {
+  cv <- cov_sets[[cn]]
+  hl <- run_limma(Lp[paired, ], df, t, cv)
+  hs <- run_limma(Sp[paired, ], df, t, cv)
+  dd <- run_limma(D, df, t, cv)
+  s2[[length(s2) + 1]] <- data.frame(model = cn, trait = t, n = hl$n[1],
+    hepatic_sig = sum(hl$FDR <= FDR), serum_sig = sum(hs$FDR <= FDR),
+    discordant = sum(dd$FDR <= FDR), key6_discordant = sum(dd$FDR[dd$feature %in% KEY6] <= FDR),
+    discordant_list = paste(dd$feature[dd$FDR <= FDR], collapse = ";"))
+  s2aa[[length(s2aa) + 1]] <- data.frame(model = cn, trait = t, metabolite = KEY6,
+    diff_logFC = round(dd$logFC[match(KEY6, dd$feature)], 3),
+    diff_FDR = signif(dd$FDR[match(KEY6, dd$feature)], 3))
+}
+s2 <- do.call(rbind, s2); s2aa <- do.call(rbind, s2aa)
+write.csv(s2, file.path(OUTP, "2_pprs_adjusted_counts.csv"), row.names = FALSE)
+write.csv(s2aa, file.path(OUTP, "2_pprs_adjusted_amino_acids.csv"), row.names = FALSE)
+cat("\n== Step 2: pPRS-adjusted paired analysis ==\n"); print(s2[, 1:7], row.names = FALSE)
+## ---------------------------------------------------------------------
+## 3a. liver–serum correlation of each matched metabolite: low vs high discordant pPRS
+## ---------------------------------------------------------------------
+okp <- !is.na(df$pprs_disc)
+g_hi <- df$pprs_disc[okp] > median(df$pprs_disc[okp])
+zL3 <- zL[okp, , drop = FALSE]; zS3 <- zS[okp, , drop = FALSE]
+rho_by <- function(grp) sapply(panel, function(m) {
+  c(lo = cor(zL3[!grp, m], zS3[!grp, m], method = "spearman", use = "complete"),
+    hi = cor(zL3[grp, m],  zS3[grp, m],  method = "spearman", use = "complete"))
+})
+r_obs <- rho_by(g_hi)
+stat_obs <- median(r_obs["hi", ] - r_obs["lo", ])
+perm <- replicate(N_PERM, { r <- rho_by(sample(g_hi)); median(r["hi", ] - r["lo", ]) })
+p_perm <- (sum(abs(perm) >= abs(stat_obs)) + 1) / (N_PERM + 1)
+## per-metabolite interaction: serum ~ liver x pPRS_disc
+inter <- do.call(rbind, lapply(panel, function(m) {
+  d <- data.frame(s = zS[, m], l = zL[, m], g = df$pprs_disc, df[, BASE])
+  d <- d[complete.cases(d), ]
+  co <- summary(lm(s ~ l * g + age + sex + bmi, d))$coefficients
+  data.frame(metabolite = m, rho_low_pPRS = round(r_obs["lo", m], 3), rho_high_pPRS = round(r_obs["hi", m], 3),
+             interaction_beta = round(co["l:g", 1], 3), interaction_p = signif(co["l:g", 4], 3))
+}))
+inter$interaction_FDR <- signif(p.adjust(inter$interaction_p, "BH"), 3)
+s3a <- data.frame(n_low = sum(!g_hi), n_high = sum(g_hi),
+                  median_rho_low = round(median(r_obs["lo", ]), 3),
+                  median_rho_high = round(median(r_obs["hi", ]), 3),
+                  median_difference_high_minus_low = round(stat_obs, 3),
+                  permutation_p = signif(p_perm, 3),
+                  metabolites_weaker_in_high = sum(r_obs["hi", ] < r_obs["lo", ]),
+                  interactions_FDR_le_0.10 = sum(inter$interaction_FDR <= FDR))
+write.csv(inter, file.path(OUTP, "3a_coupling_by_metabolite.csv"), row.names = FALSE)
+write.csv(s3a, file.path(OUTP, "3a_coupling_summary.csv"), row.names = FALSE)
+cat("\n== Step 3a: liver–serum coupling, low vs high discordant pPRS ==\n"); print(s3a, row.names = FALSE)
+## ---------------------------------------------------------------------
+## 3b. liver TG vs serum TG coupling x pPRS
+## ---------------------------------------------------------------------
+tgc <- function(x) {
+  d <- meta[, c("TG_serum", "TG_liver", x, BASE)]; d <- d[complete.cases(d), ]
+  names(d)[3] <- "g"
+  co <- summary(lm(TG_serum ~ TG_liver * g + age + sex + bmi, d))$coefficients
+  hi <- d$g > median(d$g)
+  data.frame(pPRS = x, n = nrow(d),
+             rho_liverTG_serumTG_low = round(cor(d$TG_liver[!hi], d$TG_serum[!hi], method = "spearman"), 3),
+             rho_liverTG_serumTG_high = round(cor(d$TG_liver[hi], d$TG_serum[hi], method = "spearman"), 3),
+             interaction_beta = round(co["TG_liver:g", 1], 3), interaction_p = signif(co["TG_liver:g", 4], 3))
+}
+s3b <- rbind(tgc("pprs_disc"), tgc("pprs_conc"))
+write.csv(s3b, file.path(OUTP, "3b_TG_coupling.csv"), row.names = FALSE)
+cat("\n== Step 3b: liver TG vs serum TG coupling ==\n"); print(s3b, row.names = FALSE)
+## ---------------------------------------------------------------------
+## 3c. liver-minus-serum gap (matched panel) vs pPRS
+## ---------------------------------------------------------------------
+s3c <- do.call(rbind, lapply(c("pprs_disc", "pprs_conc"), function(x) {
+  r <- run_limma(D, df, x, BASE)
+  data.frame(pPRS = x, metabolite = r$feature, gap_beta_per_SD = round(r$logFC, 3),
+             p = signif(r$P, 3), FDR = signif(r$FDR, 3))
+}))
+s3c <- s3c[order(s3c$pPRS, s3c$p), ]
+write.csv(s3c, file.path(OUTP, "3c_gap_vs_pprs.csv"), row.names = FALSE)
+cat("\n== Step 3c: metabolites whose liver-minus-serum gap relates to pPRS (FDR <= 0.10) ==\n")
+print(aggregate(FDR ~ pPRS, s3c, function(v) sum(v <= FDR)))
+## ---------------------------------------------------------------------
+## 3d. does serum predict histology worse when discordant pPRS is high?
+##     one cross-validated model in everyone; AUC evaluated in each half
+## ---------------------------------------------------------------------
+s3d <- list()
+for (o in c("steatosis", "inflammation", "MASH")) {
+  y <- df[[o]]
+  ok <- !is.na(y) & !is.na(df$pprs_disc) & complete.cases(Xclin)
+  yy <- y[ok]; hi <- df$pprs_disc[ok] > median(df$pprs_disc[ok])
+  rs <- cv_auc(Sp[paired, ][ok, ], yy, rep(1, ncol(Sp)))
+  rc <- cv_auc(Xclin[ok, , drop = FALSE], yy, rep(0, ncol(Xclin)))
+  for (set in c("serum_all", "clinical")) {
+    pr <- if (set == "serum_all") rs$oof else rc$oof
+    r_lo <- roc(yy[!hi], pr[!hi], levels = c(0, 1), direction = "<", quiet = TRUE)
+    r_hi <- roc(yy[hi],  pr[hi],  levels = c(0, 1), direction = "<", quiet = TRUE)
+    s3d[[length(s3d) + 1]] <- data.frame(outcome = o, predictors = set,
+      n_low = sum(!hi), cases_low = sum(yy[!hi]), AUC_low_pPRS = round(as.numeric(auc(r_lo)), 3),
+      n_high = sum(hi), cases_high = sum(yy[hi]), AUC_high_pPRS = round(as.numeric(auc(r_hi)), 3),
+      DeLong_p_unpaired = signif(roc.test(r_lo, r_hi, method = "delong", paired = FALSE)$p.value, 3))
+  }
+}
+s3d <- do.call(rbind, s3d)
+write.csv(s3d, file.path(OUTP, "3d_auc_by_pprs.csv"), row.names = FALSE)
+cat("\n== Step 3d: AUC in low vs high discordant pPRS ==\n"); print(s3d, row.names = FALSE)
+## ---------------------------------------------------------------------
+## 4. genetic mediation: pPRS -> hepatic TG index -> histology
+## ---------------------------------------------------------------------
+s4 <- list()
+for (x in c("pprs_disc", "pprs_conc")) for (o in c("steatosis", "inflammation", "MASH", "fibrosis")) {
+  d <- meta[, c(o, x, "TG_liver", BASE)]; d <- d[complete.cases(d), ]
+  names(d)[1:2] <- c("y", "g")
+  mfit <- lm(TG_liver ~ g + age + sex + bmi, d)
+  ofit <- glm(y ~ TG_liver + g + age + sex + bmi, family = binomial, data = d)
+  set.seed(7)
+  m <- mediation::mediate(mfit, ofit, treat = "g", mediator = "TG_liver", boot = TRUE, sims = N_BOOT)
+  s4[[length(s4) + 1]] <- data.frame(pPRS = x, outcome = o, n = nrow(d), cases = sum(d$y),
+    pPRS_to_TG_beta = round(coef(mfit)["g"], 3),
+    pPRS_to_TG_p = signif(summary(mfit)$coefficients["g", 4], 3),
+    ACME = round(m$d.avg, 4), ACME_CI = sprintf("%.4f to %.4f", m$d.avg.ci[1], m$d.avg.ci[2]),
+    ACME_p = signif(m$d.avg.p, 3),
+    direct = round(m$z.avg, 4), direct_p = signif(m$z.avg.p, 3),
+    total = round(m$tau.coef, 4), total_p = signif(m$tau.p, 3),
+    prop_mediated = round(m$n.avg, 3))
+}
+s4 <- do.call(rbind, s4)
+s4$ACME_FDR <- signif(p.adjust(s4$ACME_p, "BH"), 3)
+write.csv(s4, file.path(OUTP, "4_genetic_mediation.csv"), row.names = FALSE)
+cat("\n== Step 4: pPRS -> hepatic TG -> histology ==\n")
+print(s4[, c("pPRS", "outcome", "n", "pPRS_to_TG_beta", "pPRS_to_TG_p", "ACME", "ACME_p",
+             "ACME_FDR", "total_p", "prop_mediated")], row.names = FALSE)
+## ---------------------------------------------------------------------
+## summary
+## ---------------------------------------------------------------------
+sink(file.path(OUTP, "summary_pprs.txt"), split = TRUE)
+cat("pPRS SUMMARY\n============\n")
+cat("pPRS available: metadata", sum(!is.na(meta$pprs_disc)), "| paired", sum(!is.na(df$pprs_disc)), "\n\n")
+cat("Step 1 sanity (beta per SD, p):\n")
+for (i in seq_len(nrow(s1))) cat(sprintf("  %-12s %-10s beta %6.3f  p %.3g  %s\n", s1$outcome[i], s1$pPRS[i],
+                                        s1$beta_per_SD[i], s1$p[i], ifelse(s1$as_expected[i], "as expected", "NOT as expected")))
+cat("\nStep 2 key-6 amino-acid discordance for inflammation:\n")
+for (cn in names(cov_sets)) cat(sprintf("  %-20s %d of 6\n", cn,
+  s2$key6_discordant[s2$model == cn & s2$trait == "inflammation"]))
+cat(sprintf("\nStep 3a median liver-serum rho: low pPRS %.3f, high pPRS %.3f (permutation p = %.3g)\n",
+            s3a$median_rho_low, s3a$median_rho_high, s3a$permutation_p))
+cat(sprintf("Step 3b liver TG x discordant pPRS on serum TG: beta %.3f, p = %.3g\n",
+            s3b$interaction_beta[1], s3b$interaction_p[1]))
+cat("Step 3c gap metabolites FDR<=0.10:", sum(s3c$FDR[s3c$pPRS == "pprs_disc"] <= FDR), "(discordant),",
+    sum(s3c$FDR[s3c$pPRS == "pprs_conc"] <= FDR), "(concordant)\n")
+cat("Step 3d serum AUC low vs high pPRS:\n")
+x <- s3d[s3d$predictors == "serum_all", ]
+for (i in seq_len(nrow(x))) cat(sprintf("  %-12s %.3f vs %.3f (p = %.3g)\n", x$outcome[i],
+                                       x$AUC_low_pPRS[i], x$AUC_high_pPRS[i], x$DeLong_p_unpaired[i]))
+cat("Step 4 mediation via hepatic TG (ACME FDR):\n")
+for (i in seq_len(nrow(s4))) cat(sprintf("  %-10s %-12s ACME %.4f  FDR %.3g  prop %.2f\n", s4$pPRS[i],
+                                        s4$outcome[i], s4$ACME[i], s4$ACME_FDR[i], s4$prop_mediated[i]))
+sink()
+cat("\nDone. Wrote all files to", OUTP, "\n")
+```
+
+```{r partitio-02}
+## =====================================================================
+##  Figure: genetic predisposition to hepatic lipid retention (pPRS)
+##  a  pPRS effects on hepatic TG, serum TG, steatosis grade, NAS
+##  b  discordant pPRS: hepatic TG up, serum TG down (same people)
+##  c  mediation: discordant pPRS -> hepatic TG -> histology
+##  d  liver–serum coupling of 40 matched metabolites, low vs high pPRS
+##
+##  Run in the same R session after pPRS_liver_serum.R (uses `meta`),
+##  from the folder that contains pprs_liver_serum/.
+##  Output: Fig_pPRS.pdf (vector) and Fig_pPRS.png (600 dpi), 180 mm wide
+## =====================================================================
+suppressPackageStartupMessages({
+  library(ggplot2); library(patchwork); library(dplyr); library(tidyr); library(ggrepel)
+})
+if (!exists("meta") || !"pprs_disc" %in% names(meta)) stop("run pPRS_liver_serum.R first")
+IN <- "pprs_liver_serum"
+N_BOOT_PLOT <- 2000                 # same as the analysis -> identical estimates (seed 7)
+## palette (validated: blue/orange pass CVD and contrast checks) + neutral inks
+COL   <- c(Discordant = "#2a78d6", Concordant = "#eb6834")
+INK   <- "#0b0b0b"; INK2 <- "#52514e"; MUTED <- "#8d8c86"; GRID <- "#e8e7e2"; PT <- "#b9b8b1"
+EFF   <- c("Indirect (via hepatic TG)" = "#2a78d6", "Direct" = "#a9a8a1", "Total" = "#0b0b0b")
+theme_pub <- function(base = 8.5) {
+  theme_minimal(base_size = base, base_family = "Helvetica") +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(colour = GRID, linewidth = 0.3),
+          axis.text = element_text(colour = INK2),
+          axis.title = element_text(colour = INK),
+          axis.ticks = element_blank(),
+          plot.title = element_text(face = "bold", colour = INK, size = base + 1, margin = margin(b = 4)),
+          plot.subtitle = element_text(colour = INK2, size = base - 0.5, margin = margin(b = 6)),
+          legend.position = "top", legend.justification = "left",
+          legend.title = element_blank(), legend.text = element_text(colour = INK),
+          legend.margin = margin(0, 0, 0, 0), legend.key.size = unit(3.5, "mm"),
+          strip.text = element_text(face = "bold", colour = INK, hjust = 0),
+          plot.tag = element_text(face = "bold", size = base + 3, colour = INK),
+          plot.margin = margin(4, 6, 4, 4))
+}
+fmt_p <- function(p) ifelse(p < 0.001, paste0("p = ", formatC(p, format = "e", digits = 1)),
+                            paste0("p = ", formatC(p, format = "f", digits = 3)))
+## ---------------------------------------------------------------------
+## a. pPRS effects (beta per SD, 95% CI)
+## ---------------------------------------------------------------------
+s1 <- read.csv(file.path(IN, "1_sanity_check.csv")) %>%
+  mutate(score = factor(ifelse(pPRS == "pprs_disc", "Discordant", "Concordant"),
+                        levels = c("Discordant", "Concordant")),
+         outcome = factor(outcome, levels = rev(c("TG_liver", "TG_serum", "steat_grade", "NAS")),
+                          labels = rev(c("Hepatic TG", "Serum TG", "Steatosis grade", "NAS"))),
+         lo = beta_per_SD - 1.96 * SE, hi = beta_per_SD + 1.96 * SE)
+x_lab_a <- max(s1$hi) + 0.06
+pd_a <- position_dodge(width = 0.62)
+pa <- ggplot(s1, aes(beta_per_SD, outcome, colour = score)) +
+  geom_vline(xintercept = 0, colour = INK2, linewidth = 0.4) +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 0.8, position = pd_a) +
+  geom_point(size = 2.6, position = pd_a, stroke = 0) +
+  geom_text(aes(x = x_lab_a, label = fmt_p(p), group = score), position = pd_a,
+            hjust = 0, size = 2.5, colour = INK2, family = "Helvetica") +
+  scale_colour_manual(values = COL, labels = c("Discordant pPRS", "Concordant pPRS")) +
+  scale_x_continuous(expand = expansion(mult = c(0.04, 0.38))) +
+  labs(x = "β per SD of pPRS (95% CI)", y = NULL,
+       title = "Genetic scores for liver fat",
+       subtitle = "Adjusted for age, sex and BMI (n = 211)") +
+  theme_pub() + theme(panel.grid.major.y = element_blank())
+## ---------------------------------------------------------------------
+## b. discordant pPRS vs hepatic and serum TG (same participants)
+## ---------------------------------------------------------------------
+d_b <- meta %>% filter(!is.na(pprs_disc)) %>%
+  dplyr::select(pprs_disc, TG_liver, TG_serum) %>%
+  pivot_longer(-pprs_disc, names_to = "compartment", values_to = "z") %>%
+  filter(!is.na(z)) %>%
+  mutate(compartment = factor(compartment, levels = c("TG_liver", "TG_serum"),
+                              labels = c("Hepatic TG", "Serum TG")))
+ann_b <- s1 %>% filter(score == "Discordant", outcome %in% c("Hepatic TG", "Serum TG")) %>%
+  transmute(compartment = factor(as.character(outcome), levels = c("Hepatic TG", "Serum TG")),
+            label = sprintf("β = %.2f\n%s", beta_per_SD, fmt_p(p)))
+pb <- ggplot(d_b, aes(pprs_disc, z)) +
+  geom_hline(yintercept = 0, colour = GRID, linewidth = 0.4) +
+  geom_point(colour = PT, size = 1.1, alpha = 0.8, stroke = 0) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = COL["Discordant"],
+              fill = COL["Discordant"], alpha = 0.15, linewidth = 1) +
+  geom_text(data = ann_b, aes(x = -Inf, y = Inf, label = label), hjust = -0.08, vjust = 1.25,
+            size = 2.6, colour = INK, family = "Helvetica", lineheight = 0.95) +
+  facet_wrap(~ compartment, nrow = 1) +
+  labs(x = "Discordant pPRS (SD)", y = "Triglycerides (SD)",
+       title = "Same scores, opposite compartments",
+       subtitle = "Hepatic TG rises while serum TG falls") +
+  theme_pub()
+## ---------------------------------------------------------------------
+## c. mediation: discordant pPRS -> hepatic TG -> histology
+## ---------------------------------------------------------------------
+med <- bind_rows(lapply(c("steatosis", "inflammation", "MASH", "fibrosis"), function(o) {
+  d <- meta[, c(o, "pprs_disc", "TG_liver", "age", "sex", "bmi")]; d <- d[complete.cases(d), ]
+  names(d)[1:2] <- c("y", "g")
+  mf <- lm(TG_liver ~ g + age + sex + bmi, d)
+  of <- glm(y ~ TG_liver + g + age + sex + bmi, family = binomial, data = d)
+  set.seed(7)
+  m <- mediation::mediate(mf, of, treat = "g", mediator = "TG_liver", boot = TRUE, sims = N_BOOT_PLOT)
+  data.frame(outcome = o,
+             effect = c("Indirect (via hepatic TG)", "Direct", "Total"),
+             est = 100 * c(m$d.avg, m$z.avg, m$tau.coef),
+             lo  = 100 * c(m$d.avg.ci[1], m$z.avg.ci[1], m$tau.ci[1]),
+             hi  = 100 * c(m$d.avg.ci[2], m$z.avg.ci[2], m$tau.ci[2]),
+             prop = m$n.avg, total_p = m$tau.p)
+}))
+write.csv(med, file.path(IN, "4_mediation_for_plot.csv"), row.names = FALSE)
+med <- med %>%
+  mutate(outcome_lab = recode(outcome, steatosis = "Steatosis", inflammation = "Lobular\ninflammation",
+                              MASH = "MASH", fibrosis = "Fibrosis (F1–F4)"),
+         outcome_lab = factor(outcome_lab, levels = rev(c("Steatosis", "Lobular\ninflammation", "MASH", "Fibrosis (F1–F4)"))),
+         effect = factor(effect, levels = rev(names(EFF))))
+lab_c <- med %>% group_by(outcome_lab) %>% summarise(prop = first(prop), total_p = first(total_p), .groups = "drop") %>%
+  mutate(label = ifelse(total_p < 0.05, sprintf("%.0f%% mediated", pmin(prop, 1) * 100),
+                        "total effect n.s."))
+x_lab_c <- max(med$hi) + 1
+pd_c <- position_dodge(width = 0.7)
+pc <- ggplot(med, aes(est, outcome_lab, colour = effect)) +
+  geom_vline(xintercept = 0, colour = INK2, linewidth = 0.4) +
+  geom_linerange(aes(xmin = lo, xmax = hi), linewidth = 0.8, position = pd_c) +
+  geom_point(size = 2.4, position = pd_c, stroke = 0) +
+  geom_text(data = lab_c, aes(x = x_lab_c, y = outcome_lab, label = label), inherit.aes = FALSE,
+            hjust = 0, size = 2.5, colour = INK2, family = "Helvetica") +
+  scale_colour_manual(values = EFF, breaks = names(EFF)) +
+  scale_x_continuous(expand = expansion(mult = c(0.04, 0.45))) +
+  labs(x = "Effect per SD of discordant pPRS\n(percentage points, 95% CI)", y = NULL,
+       title = "Genetic effect runs through hepatic fat",
+       subtitle = "Discordant pPRS → hepatic TG → histology (2,000 bootstraps)") +
+  theme_pub() + theme(panel.grid.major.y = element_blank())
+## ---------------------------------------------------------------------
+## d. liver–serum coupling, low vs high discordant pPRS
+## ---------------------------------------------------------------------
+cp  <- read.csv(file.path(IN, "3a_coupling_by_metabolite.csv"))
+cps <- read.csv(file.path(IN, "3a_coupling_summary.csv"))
+pretty_name <- function(x) {
+  x <- gsub("_", " ", x)
+  ifelse(grepl("^[A-Z]{2,5}$", x), x,
+         paste0(toupper(substr(tolower(x), 1, 1)), substring(tolower(x), 2)))
+}
+cp <- cp %>% mutate(name = pretty_name(metabolite),
+                    show = rank(-abs(rho_high_pPRS - rho_low_pPRS)) <= 4 | rank(-rho_low_pPRS) <= 2)
+lim <- range(c(cp$rho_low_pPRS, cp$rho_high_pPRS)) + c(-0.05, 0.05)
+pdd <- ggplot(cp, aes(rho_low_pPRS, rho_high_pPRS)) +
+  geom_abline(slope = 1, intercept = 0, colour = MUTED, linewidth = 0.4, linetype = "22") +
+  geom_hline(yintercept = 0, colour = GRID, linewidth = 0.4) +
+  geom_vline(xintercept = 0, colour = GRID, linewidth = 0.4) +
+  geom_point(colour = COL["Discordant"], size = 2, alpha = 0.85, stroke = 0) +
+  geom_text_repel(data = filter(cp, show), aes(label = name), size = 2.4, colour = INK2,
+                  family = "Helvetica", segment.colour = MUTED, segment.size = 0.25,
+                  min.segment.length = 0, box.padding = 0.35, seed = 1) +
+  annotate("text", x = lim[2], y = lim[1], hjust = 1, vjust = 0, size = 2.6, colour = INK,
+           family = "Helvetica", lineheight = 0.95,
+           label = sprintf("Median ρ %.2f vs %.2f\npermutation p = %.2f",
+                           cps$median_rho_low, cps$median_rho_high, cps$permutation_p)) +
+  coord_equal(xlim = lim, ylim = lim) +
+  labs(x = sprintf("Liver–serum ρ, low pPRS (n = %d)", cps$n_low),
+       y = sprintf("Liver–serum ρ, high pPRS (n = %d)", cps$n_high),
+       title = "Uncoupling is not genetic",
+       subtitle = "40 matched metabolites; dashed line = equal") +
+  theme_pub()
+## ---------------------------------------------------------------------
+## assemble and save
+## ---------------------------------------------------------------------
+fig <- (pa | pb) / (pc | pdd) +
+  plot_layout(widths = c(1, 1.15), heights = c(1, 1.1)) +
+  plot_annotation(tag_levels = "a")
+dev_pdf <- if (capabilities("cairo")) cairo_pdf else "pdf"
+ggsave("Fig5_pPRS.pdf", fig, width = 180, height = 165, units = "mm", device = dev_pdf)
+ggsave("Fig5_pPRS.png", fig, width = 180, height = 165, units = "mm", dpi = 600, bg = "white")
+cat("Saved Fig5_pPRS.pdf and Fig5_pPRS.png in", getwd(), "\n")
+```
+
+## Source Data Fig. 5
+
+```{r partitio-03, message=FALSE, warning=FALSE}
+write_source_data("Source Data Fig. 5.xlsx", list(
+  sd_panel("Fig. 5a", "Associations of the concordant and discordant pPRS with hepatic TG, serum TG, steatosis grade and NAS (beta per SD, 95% CI).", s1),
+  sd_panel("Fig. 5b", "Individual-level data: discordant pPRS versus standardized hepatic and serum TG.", d_b),
+  sd_panel("Fig. 5c", "Mediation of discordant pPRS effects through hepatic TG (indirect, direct, total effects; 95% bootstrap CI).", med),
+  sd_panel("Fig. 5d", "Liver-serum Spearman correlation of the 40 matched metabolites below and above the median discordant pPRS.", cp)))
+```
+
+## Keep output folder of the pPRS analysis
+
+```{r partitio-04, message=FALSE, warning=FALSE}
+PPRS_OUT <- OUTP
+```
+
+
+```{r save-state, include=FALSE}
+save_state("Fig5_pPRS")   # lets the next step start from here
+```
