@@ -104,7 +104,6 @@ masld-sex-stratified-multiomics/
 │   ├── Fig6_pathway_map/
 │   ├── Supp_EPoS_serum_validation/
 │   └── Supp_methods_tables/
-├── scripts/                                  # standalone figure scripts
 └── assets/                                   # README graphics
 ```
 
