@@ -20,7 +20,7 @@ Liver transcriptome, lipidome and polar metabolome, serum metabolome and partiti
 
 ## Contents
 
-[Main findings](#main-findings) · [Study design](#study-design) · [Workflow](#workflow) · [Repository structure](#repository-structure) · [Figure and table map](#figure-and-table-map) · [Running the code](#running-the-code) · [Source Data](#source-data) · [Statistical conventions](#statistical-conventions) · [Data availability](#data-availability) · [Citation](#citation)
+[Main findings](#main-findings) · [Study design](#study-design) · [Workflow](#workflow) · [Repository structure](#repository-structure) · [Figure and table map](#figure-and-table-map) · [Running the code](#running-the-code) · [Source Data](#source-data) · [Data availability](#data-availability) · [Citation](#citation)
 
 ---
 
@@ -163,21 +163,6 @@ Knitting writes Nature-style Source Data workbooks, one sheet per panel, to `res
 | `Source Data Fig. S1.xlsx` | PCA |
 
 Copy each file into the matching `figures/<folder>/source_data/` for upload.
-
----
-
-## Statistical conventions
-
-| Analysis | Method | Threshold |
-|---|---|---|
-| Hepatic differential expression | DESeq2 (Wald), age, BMI and sex adjusted, apeglm shrinkage; genes with ≥ 10 reads in ≥ 10 samples | FDR ≤ 0.05 |
-| Lipids and metabolites | limma, age, BMI and sex adjusted | FDR ≤ 0.10 |
-| KEGG enrichment | clusterProfiler, tested genes as background, ≥ 3 genes | FDR ≤ 0.10 |
-| Paired liver–serum difference | limma on within-subject difference (z-scored per compartment) | FDR ≤ 0.10 |
-| Discrimination | elastic net, 10 × 5-fold CV, DeLong test | – |
-| pPRS mediation | `mediation` package, 2,000 bootstrap resamples | FDR across outcomes |
-
-All tests are two-sided; multiple testing is controlled with Benjamini–Hochberg within each analysis. Thresholds are set once in the setup chunk (`FDR_GENE`, `FDR_OMICS`, `FDR_KEGG`).
 
 ---
 
