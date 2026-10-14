@@ -93,7 +93,7 @@ masld-sex-stratified-multiomics/
 │   └── MASLD_main_manuscript_analysis.Rmd   # full workflow, manuscript order, run top to bottom
 ├── figures/                                  # one folder per figure / table group
 │   ├── Table1_cohort/
-│   ├── Fig1_hepatic_transcriptome/           #   <folder>.Rmd, tables/ (CSV), source_data/
+│   ├── Fig1_hepatic_transcriptome/           #   <folder>.Rmd, source_data/
 │   ├── Hepatic_lipidome/
 │   ├── Hepatic_polar_metabolome/
 │   ├── Fig2_serum_metabolome/
