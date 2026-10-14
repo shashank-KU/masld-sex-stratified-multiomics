@@ -1,124 +1,29 @@
 ---
 title: "Table 1: cohort characteristics"
-author:
-  - name: "Shashank Gupta"
-    affiliation: "Örebro University"
+author: "Shashank Gupta"
 date: "`r Sys.Date()`"
-output:
-  github_document:
-    toc: true
-    toc_depth: 2
+output: github_document
 ---
 
-This script reproduces **Table 1: cohort characteristics**. It reuses the setup below; objects from earlier analyses may be required (see ../README.md for the run order), or knit `analysis/MASLD_main_manuscript_analysis.Rmd` as a whole. Source Data are written to `results/source_data/`.
-
-# 1. Setup
-
-Packages, paths, significance thresholds and helper functions. Inputs are read from `data/`; tables and figures are written to `results/`.
+Part of the analysis code for the matched liver–serum multi-omics study in MASLD. This script is self-contained: open it in RStudio (or `rmarkdown::render("Table1_cohort.Rmd")` from this folder). Input data are read from `data/` (see `data/README.md`); Supplementary Tables used here are in `Source_data/`; Source Data for this item are written to `Source_data/`; other outputs go to `results/`.
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(
-  warning = FALSE
-)
-
-# ---- Paths -------------------------------------------------------------
-# Raw input files are read from data/ (not included in the repository, see data/README.md) and everything
-# that is written goes to results/. Both are resolved once, to absolute paths, in this order:
-#   1. environment variable MASLD_DATA_DIR / MASLD_RESULTS_DIR
-#   2. ../data and ../results (this file lives in analysis/), or data/ and results/ in the working directory
-.cands <- c(Sys.getenv("MASLD_DATA_DIR", unset = NA), "../data", "data")
-.cands <- .cands[!is.na(.cands) & nzchar(.cands)]
-.hit <- .cands[dir.exists(.cands)]
-if (!length(.hit)) stop("Input folder not found. Set it first, e.g.\n  Sys.setenv(MASLD_DATA_DIR = \"/path/to/folder/with/Analyisis\")")
-project_dir <- normalizePath(.hit[1])
-.res <- Sys.getenv("MASLD_RESULTS_DIR",
-                   unset = if (basename(project_dir) == "data") file.path(dirname(project_dir), "results") else file.path(project_dir, "results"))
-dir.create(file.path(.res, "tables"), showWarnings = FALSE, recursive = TRUE)
-results_dir <- normalizePath(.res)
-OUT_DIR <- results_dir                           # used by the Table 1 chunk
-knitr::opts_knit$set(root.dir = results_dir)     # relative output paths land in results/
-setwd(results_dir)                               # same when run chunk by chunk in the console
-message("Input folder:  ", project_dir, "\nResults folder: ", results_dir)
-
-# Supplementary Tables workbook (published with the paper); only used to read Table S3 (curated lipid names)
-# and to compare column names of the tables written below.
-SUPP_XLSX <- Sys.getenv("MASLD_SUPP_XLSX", unset = file.path(project_dir, "gupta_MASLD_SupplementaryTables.xlsx"))
-
-# ---- Significance thresholds (Benjamini-Hochberg FDR) -------------------
-FDR_GENE  <- 0.05   # DESeq2 genes (Table S1, Figs 1, 3, 6) and external replication (Tables S5-S7)
-FDR_OMICS <- 0.10   # limma lipids and metabolites (Tables S3, S4, S10a, S10b, S11, S12, S19, S20)
-FDR_KEGG  <- 0.10   # KEGG enrichment, at least 3 genes (Table S2b, Table S7)
-
-# ---- Supplementary tables are collected in manuscript order ---------------
-SUPP <- list()
-add_table <- function(name, x) {
-  SUPP[[name]] <<- x
-  if (is.data.frame(x)) {
-    write.csv(x, file.path(results_dir, "tables", paste0(gsub(" ", "_", name), ".csv")), row.names = FALSE)
-  } else for (lab in names(x)) if (is.data.frame(x[[lab]]))
-    write.csv(x[[lab]], file.path(results_dir, "tables", paste0(gsub(" ", "_", name), "_", gsub("[^A-Za-z0-9]+", "_", lab), ".csv")), row.names = FALSE)
-  invisible(x)
+knitr::opts_chunk$set(warning = FALSE)
+.root <- if (exists("REPO_ROOT")) REPO_ROOT else {
+  d <- normalizePath(getwd())
+  while (!file.exists(file.path(d, "common", "setup.R")) && dirname(d) != d) d <- dirname(d)
+  d
 }
-
-# Source Data workbooks (Nature style: one sheet per figure panel) -> results/source_data/
-sd_panel <- function(name, desc, data) list(name = name, desc = desc, data = as.data.frame(data))
-write_source_data <- function(file, panels) {
-  dir.create(file.path(results_dir, "source_data"), showWarnings = FALSE, recursive = TRUE)
-  wb <- openxlsx::createWorkbook()
-  for (p in panels) {
-    sh <- substr(p$name, 1, 31)
-    openxlsx::addWorksheet(wb, sh)
-    openxlsx::writeData(wb, sh, p$desc, startRow = 1)
-    openxlsx::writeData(wb, sh, p$data, startRow = 3)
-  }
-  openxlsx::saveWorkbook(wb, file.path(results_dir, "source_data", file), overwrite = TRUE)
-  message("Wrote source data: ", file)
-}
-
-# dotplot of an enrichment result; returns NULL (instead of an error) when nothing is enriched
-safe_dotplot <- function(x, ...) {
-  if (is.null(x) || nrow(as.data.frame(x)) == 0) return(invisible(NULL))
-  enrichplot::dotplot(x, ...)
-}
-```
-
-```{r setup-02, warning=FALSE, message=FALSE, results='hide'}
-# Load necessary libraries for data manipulation and visualization
-library(clusterProfiler)
-library(org.Hs.eg.db)
-library(enrichplot)
-library(gtsummary)
-library(ggplot2)
-library(tidyverse)
-library(RColorBrewer)
-library(POMA)
-library(ggtext)
-library(magrittr)
-library(tibble)
-library(cowplot)
-library(patchwork)
-library(ggpubr)
-library(ggstatsplot)
-library(mediation)
-library(limma)
-library(ggcorrplot)
-library(stats)
-library(corrplot)
-library(GO.db)
-library(GenomicFeatures)
-library(AnnotationDbi)
-library(DESeq2)
-library(dbplyr)
-library(dplyr)
-library(readr)
-library(gridExtra)
-library(grid)
-library(stringr)
-theme_set(theme_bw())
+source(file.path(.root, "common", "setup.R"))
 ```
 
 
-# 2. Cohort: Table 1
+```{r paths-fig, include=FALSE}
+FIG_DIR <- file.path(REPO_ROOT, "Table1_cohort")
+SD_DIR  <- file.path(FIG_DIR, "Source_data")
+```
+
+# Cohort: Table 1
 
 Participant characteristics of the 211 adults.
 
@@ -263,3 +168,7 @@ rownames(phenotype) <- phenotype$id
 phenotype <- phenotype[,-1]
 ```
 
+
+```{r save-state, include=FALSE}
+save_state("Table1_cohort")   # lets the next step start from here
+```
